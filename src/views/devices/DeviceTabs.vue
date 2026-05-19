@@ -1,0 +1,506 @@
+<script setup>
+import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
+import * as echarts from 'echarts'
+import dayjs from 'dayjs'
+import { DataLine, Histogram, List, Refresh, Document, View } from '@element-plus/icons-vue'
+
+const props = defineProps({
+  detail: { type: Object, required: true }
+})
+
+const activeTab = ref('realtime')
+const histRange = ref('24h')
+
+/* ---------- 详情字段映射 ---------- */
+const typeLabel = (t) => ({ station: '站点', cabin: '舱级', cluster: '簇级', pack: 'PACK 级' }[t] || '设备')
+
+/* ---------- 历史曲线 ---------- */
+const trendEl = ref(null)
+let trendChart = null
+
+function genSeries(rangeKey, type) {
+  const cfg = { '24h': { n: 96, step: 15, fmt: 'HH:mm' }, '7d': { n: 84, step: 120, fmt: 'MM-DD HH:mm' }, '30d': { n: 90, step: 480, fmt: 'MM-DD' } }[rangeKey]
+  const baseTime = dayjs().subtract(cfg.n * cfg.step, 'minute')
+  const labels = Array.from({ length: cfg.n }, (_, i) => baseTime.add(i * cfg.step, 'minute').format(cfg.fmt))
+  const noise = (a) => a + (Math.random() - 0.5) * 0.4
+  // 不同类型给不同维度
+  if (type === 'pack') {
+    return {
+      labels,
+      series: [
+        { name: 'PACK 电压(V)', color: '#015eea', data: labels.map(() => +noise(47.3).toFixed(2)) },
+        { name: '电芯最高(V)', color: '#06b6d4', data: labels.map(() => +noise(3.36).toFixed(3)) },
+        { name: '电芯最低(V)', color: '#6366f1', data: labels.map(() => +noise(3.31).toFixed(3)) },
+        { name: '最高温(℃)',   color: '#ef4444', data: labels.map((_, i) => +(29 + Math.sin(i / 12) * 3 + Math.random() * 0.8).toFixed(1)), yAxis: 1 },
+        { name: 'SOC(%)',     color: '#22d3a0', data: labels.map((_, i) => +(50 + Math.sin(i / 8) * 28 + Math.random() * 2).toFixed(1)), yAxis: 1 }
+      ]
+    }
+  }
+  if (type === 'cluster') {
+    return {
+      labels,
+      series: [
+        { name: '簇电压(V)', color: '#015eea', data: labels.map(() => +noise(760).toFixed(1)) },
+        { name: '簇电流(A)', color: '#6366f1', data: labels.map((_, i) => +(80 * Math.sin(i / 10) + (Math.random() - 0.5) * 8).toFixed(1)) },
+        { name: '功率(kW)',  color: '#06b6d4', data: labels.map((_, i) => +(60 * Math.sin(i / 10) + (Math.random() - 0.5) * 6).toFixed(1)) },
+        { name: '绝缘(kΩ)',  color: '#22d3a0', data: labels.map(() => Math.floor(4500 + Math.random() * 1000)), yAxis: 1 }
+      ]
+    }
+  }
+  if (type === 'cabin') {
+    return {
+      labels,
+      series: [
+        { name: '舱内温度(℃)', color: '#ef4444', data: labels.map((_, i) => +(25 + Math.sin(i / 14) * 2 + Math.random() * 0.6).toFixed(1)) },
+        { name: '舱内湿度(%)', color: '#06b6d4', data: labels.map(() => Math.floor(40 + Math.random() * 12)) },
+        { name: 'H₂(ppm)',    color: '#f59e0b', data: labels.map(() => Math.floor(Math.random() * 30)), yAxis: 1 },
+        { name: 'VOC(ppm)',   color: '#6366f1', data: labels.map(() => Math.floor(Math.random() * 80)), yAxis: 1 }
+      ]
+    }
+  }
+  // station
+  return {
+    labels,
+    series: [
+      { name: '负荷功率(MW)', color: '#015eea', data: labels.map((_, i) => +(15 * Math.sin(i / 10) + (Math.random() - 0.5) * 3).toFixed(1)) },
+      { name: '总告警数',     color: '#ef4444', data: labels.map(() => Math.floor(Math.random() * 4)), yAxis: 1 },
+      { name: '风险指数',     color: '#22d3a0', data: labels.map(() => +(80 + (Math.random() - 0.5) * 8).toFixed(1)), yAxis: 1 }
+    ]
+  }
+}
+
+function renderTrend() {
+  if (!trendChart) return
+  const { labels, series } = genSeries(histRange.value, props.detail.type)
+  trendChart.setOption({
+    tooltip: { trigger: 'axis' },
+    legend: { top: 0, right: 0, textStyle: { fontSize: 12 } },
+    grid: { left: 50, right: 56, top: 36, bottom: 30 },
+    xAxis: { type: 'category', data: labels, axisLabel: { color: '#525c75', fontSize: 11, interval: Math.floor(labels.length / 10) } },
+    yAxis: [
+      { type: 'value', splitLine: { lineStyle: { color: '#eef0f7' } }, axisLabel: { color: '#525c75', fontSize: 11 } },
+      { type: 'value', position: 'right', splitLine: { show: false }, axisLabel: { color: '#525c75', fontSize: 11 } }
+    ],
+    series: series.map(s => ({
+      name: s.name, type: 'line', smooth: true, showSymbol: false,
+      yAxisIndex: s.yAxis || 0,
+      data: s.data,
+      lineStyle: { color: s.color, width: 2 },
+      itemStyle: { color: s.color },
+      areaStyle: s.name.includes('电压') || s.name.includes('功率') ? { color: s.color + '20' } : undefined
+    }))
+  }, true)
+}
+
+/* ---------- 单体分布 ---------- */
+const distEl = ref(null)
+let distChart = null
+
+function getDistData() {
+  const t = props.detail.type
+  if (t === 'pack') {
+    // 104 节电芯
+    return Array.from({ length: 104 }, (_, i) => ({ id: 'C-' + String(i + 1).padStart(3, '0'), v: +(3.30 + Math.random() * 0.08).toFixed(3) }))
+  }
+  if (t === 'cluster') {
+    // 16 个 PACK
+    return Array.from({ length: 16 }, (_, i) => ({ id: 'PACK-' + String(i + 1).padStart(2, '0'), v: +(47 + Math.random() * 1.2).toFixed(2) }))
+  }
+  if (t === 'cabin') {
+    // 4 个簇
+    return Array.from({ length: 4 }, (_, i) => ({ id: `${i + 1}#簇`, v: +(750 + Math.random() * 30).toFixed(1) }))
+  }
+  // station: 各舱平均电压
+  return Array.from({ length: props.detail.info?.cabins || 5 }, (_, i) => ({ id: `${i + 1}#舱`, v: +(48 + Math.random() * 6).toFixed(1) }))
+}
+
+const unitLabel = computed(() => ({ pack: 'V (单体)', cluster: 'V (PACK)', cabin: 'V (簇)', station: 'kW (舱)' }[props.detail.type]))
+
+function renderDist() {
+  if (!distChart) return
+  const data = getDistData()
+  const vs = data.map(d => d.v)
+  const avg = vs.reduce((a, b) => a + b, 0) / vs.length
+  const max = Math.max(...vs), min = Math.min(...vs)
+  distChart.setOption({
+    tooltip: {
+      trigger: 'axis', axisPointer: { type: 'shadow' },
+      formatter: (p) => `${data[p[0].dataIndex].id}<br/>${p[0].marker} <b>${p[0].value} ${unitLabel.value.split(' ')[0]}</b>`
+    },
+    grid: { left: 50, right: 24, top: 34, bottom: 30 },
+    xAxis: {
+      type: 'category', data: data.map(d => d.id),
+      axisLabel: { color: '#8a93a8', fontSize: 10, interval: Math.max(0, Math.floor(data.length / 16)) },
+      axisLine: { lineStyle: { color: '#dadfeb' } }
+    },
+    yAxis: {
+      type: 'value', name: unitLabel.value, nameTextStyle: { color: '#8a93a8', fontSize: 11 },
+      min: min - (max - min) * 0.2, max: max + (max - min) * 0.2,
+      splitLine: { lineStyle: { color: '#eef0f7' } },
+      axisLabel: { color: '#525c75', fontSize: 11 }
+    },
+    series: [{
+      type: 'bar', barWidth: '85%', data: vs,
+      itemStyle: {
+        color: (p) => {
+          const v = p.value
+          if (v < avg - (max - min) * 0.4) return '#ef4444'
+          if (v < avg - (max - min) * 0.2) return '#f59e0b'
+          if (v > avg + (max - min) * 0.4) return '#06b6d4'
+          return '#015eea'
+        }
+      },
+      markLine: {
+        symbol: 'none',
+        data: [{ type: 'average', name: '平均', lineStyle: { color: '#22d3a0', type: 'dashed', width: 1.5 }, label: { formatter: '均值', color: '#22d3a0', position: 'end' } }]
+      }
+    }]
+  }, true)
+}
+
+const distStats = computed(() => {
+  const data = getDistData()
+  const vs = data.map(d => d.v)
+  const avg = vs.reduce((a, b) => a + b, 0) / vs.length
+  const max = Math.max(...vs), min = Math.min(...vs)
+  return {
+    count: data.length,
+    max: max.toFixed(3),
+    min: min.toFixed(3),
+    avg: avg.toFixed(3),
+    delta: ((max - min) * (props.detail.type === 'pack' ? 1000 : 1)).toFixed(props.detail.type === 'pack' ? 0 : 2),
+    unit: props.detail.type === 'pack' ? 'mV' : unitLabel.value.split(' ')[0]
+  }
+})
+
+/* ---------- 事件日志 ---------- */
+const events = computed(() => {
+  const base = props.detail.label
+  const types = {
+    pack: [
+      { t: 'warn', icon: '!', title: '单体压差告警', desc: 'PACK 内最大压差 52mV，超过预警阈值 50mV', time: '2026-05-17 14:08:23', status: '已恢复' },
+      { t: 'info', icon: 'i', title: '健康度更新', desc: 'SOH 由 95.2% → 94.8%（年衰减率 4.5%）', time: '2026-05-15 02:00:00', status: '记录' },
+      { t: 'ok',   icon: '✓', title: '完成均衡', desc: '主动均衡完成，压差由 48mV → 22mV', time: '2026-05-12 03:42:10', status: '正常' },
+      { t: 'warn', icon: '!', title: '温度偏高', desc: '最高温 37.2℃ 接近告警阈值', time: '2026-05-08 16:21:55', status: '已恢复' }
+    ],
+    cluster: [
+      { t: 'warn', icon: '!', title: '充电电流异常波动', desc: '簇电流 5 秒内从 85A → 32A → 78A，已自检', time: '2026-05-17 11:42:08', status: '已恢复' },
+      { t: 'info', icon: 'i', title: '日报生成', desc: '日充放电量 62.4 MWh / 循环次数 1 次', time: '2026-05-17 00:05:00', status: '记录' },
+      { t: 'ok',   icon: '✓', title: '巡检完成', desc: '运维人员张三完成簇级巡检，无异常', time: '2026-05-15 10:18:00', status: '正常' }
+    ],
+    cabin: [
+      { t: 'warn', icon: '!', title: '舱内温度偏高', desc: '舱内温度 28.4℃ 超过设定值 27℃ 持续 12 分钟', time: '2026-05-17 13:35:00', status: '已恢复' },
+      { t: 'err',  icon: '×', title: '消防探测器故障（已修）', desc: 'P3 烟感探测器通讯中断 → 已更换', time: '2026-05-10 09:18:42', status: '已修复' },
+      { t: 'ok',   icon: '✓', title: '年度消防检查', desc: '灭火剂压力 12.3 MPa，瓶组完好', time: '2026-04-22 14:00:00', status: '正常' }
+    ],
+    station: [
+      { t: 'info', icon: 'i', title: '保单生效', desc: `保单 ${props.detail.info?.insurancePolicy || ''} 已生效`, time: '2026-01-15 00:00:00', status: '记录' },
+      { t: 'ok',   icon: '✓', title: '年度风险评估', desc: `风险评分 ${props.detail.info?.riskScore || 0}（低风险）`, time: '2026-04-01 10:00:00', status: '正常' },
+      { t: 'warn', icon: '!', title: '隐患整改', desc: '舱外电缆桥架松动 → 已加固', time: '2026-03-28 15:22:00', status: '已闭环' },
+      { t: 'info', icon: 'i', title: '巡检任务', desc: '本月完成例行巡检 4 次，合格率 100%', time: '2026-04-30 18:00:00', status: '记录' }
+    ]
+  }
+  return types[props.detail.type] || []
+})
+
+/* ---------- 切换 / 生命周期 ---------- */
+function initChartsIfNeeded() {
+  nextTick(() => {
+    if (activeTab.value === 'history' && trendEl.value && !trendChart) {
+      trendChart = echarts.init(trendEl.value); renderTrend()
+    }
+    if (activeTab.value === 'dist' && distEl.value && !distChart) {
+      distChart = echarts.init(distEl.value); renderDist()
+    }
+  })
+}
+
+watch(activeTab, () => initChartsIfNeeded())
+watch(histRange, () => renderTrend())
+watch(() => props.detail, () => {
+  trendChart?.dispose(); trendChart = null
+  distChart?.dispose(); distChart = null
+  initChartsIfNeeded()
+}, { deep: false })
+
+function onResize() { trendChart?.resize(); distChart?.resize() }
+
+onMounted(() => {
+  window.addEventListener('resize', onResize)
+  initChartsIfNeeded()
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', onResize)
+  trendChart?.dispose(); distChart?.dispose()
+})
+</script>
+
+<template>
+  <div class="dt">
+    <el-tabs v-model="activeTab" class="dt-tabs">
+      <el-tab-pane name="realtime">
+        <template #label>
+          <span class="t-l"><el-icon><View /></el-icon> 实时数据</span>
+        </template>
+        <div class="tp">
+          <template v-if="detail.type === 'station'">
+            <el-descriptions :column="3" border size="default" class="desc">
+              <el-descriptions-item label="站点编号">{{ detail.info.id }}</el-descriptions-item>
+              <el-descriptions-item label="所在位置">{{ detail.info.location }}</el-descriptions-item>
+              <el-descriptions-item label="投运日期">{{ detail.info.onlineDate }}</el-descriptions-item>
+              <el-descriptions-item label="总容量">{{ detail.info.capacityMWh }} MWh / {{ detail.info.powerMW }} MW</el-descriptions-item>
+              <el-descriptions-item label="主设备厂家">{{ detail.info.vendor }}</el-descriptions-item>
+              <el-descriptions-item label="消防配置">{{ detail.info.fireSystem }}</el-descriptions-item>
+              <el-descriptions-item label="舱 / 簇 / PACK">{{ detail.info.cabins }} / {{ detail.info.clusters }} / {{ detail.info.packs }}</el-descriptions-item>
+              <el-descriptions-item label="平均 SOH">{{ detail.info.soh }} %</el-descriptions-item>
+              <el-descriptions-item label="风险评分">
+                <el-tag :type="detail.info.riskScore >= 90 ? 'success' : detail.info.riskScore >= 75 ? '' : 'warning'" size="small">{{ detail.info.riskScore }} 分</el-tag>
+              </el-descriptions-item>
+              <el-descriptions-item label="保单编号">{{ detail.info.insurancePolicy }}</el-descriptions-item>
+              <el-descriptions-item label="保险状态">{{ detail.info.insuranceStatus }}</el-descriptions-item>
+              <el-descriptions-item label="年保费">{{ detail.info.annualPremium }}</el-descriptions-item>
+              <el-descriptions-item label="承保金额">{{ detail.info.coverage }}</el-descriptions-item>
+              <el-descriptions-item label="30天告警">{{ detail.info.alarmCount30d }} 次（严重 {{ detail.info.severeAlarm30d }}）</el-descriptions-item>
+              <el-descriptions-item label="巡检合格率">{{ detail.info.inspectionRate }} %</el-descriptions-item>
+            </el-descriptions>
+            <div class="sub-title">承保设备结构</div>
+            <div class="hierarchy">
+              <div class="hi-item"><div class="hi-icon" style="background:#015eea">站</div><div><div class="hi-l">站点</div><div class="hi-v">1</div></div></div>
+              <div class="hi-arrow">→</div>
+              <div class="hi-item"><div class="hi-icon" style="background:#06b6d4">舱</div><div><div class="hi-l">舱体</div><div class="hi-v">{{ detail.info.cabins }}</div></div></div>
+              <div class="hi-arrow">→</div>
+              <div class="hi-item"><div class="hi-icon" style="background:#6366f1">簇</div><div><div class="hi-l">电池簇</div><div class="hi-v">{{ detail.info.clusters }}</div></div></div>
+              <div class="hi-arrow">→</div>
+              <div class="hi-item"><div class="hi-icon" style="background:#22d3a0">P</div><div><div class="hi-l">PACK</div><div class="hi-v">{{ detail.info.packs }}</div></div></div>
+            </div>
+          </template>
+
+          <template v-if="detail.type === 'cabin'">
+            <el-descriptions :column="3" border class="desc">
+              <el-descriptions-item label="舱内温度">{{ detail.info.temperature }} ℃</el-descriptions-item>
+              <el-descriptions-item label="舱内湿度">{{ detail.info.humidity }} %</el-descriptions-item>
+              <el-descriptions-item label="烟雾浓度">{{ detail.info.smoke }} mg/m³</el-descriptions-item>
+              <el-descriptions-item label="H₂ 浓度">{{ detail.info.h2 }} ppm</el-descriptions-item>
+              <el-descriptions-item label="VOC">{{ detail.info.voc }} ppm</el-descriptions-item>
+              <el-descriptions-item label="灭火剂压力">{{ detail.info.gasPressure }} MPa</el-descriptions-item>
+              <el-descriptions-item label="消防状态">
+                <el-tag type="success" size="small">{{ detail.info.fireStatus }}</el-tag>
+              </el-descriptions-item>
+            </el-descriptions>
+          </template>
+
+          <template v-if="detail.type === 'cluster'">
+            <el-descriptions :column="3" border class="desc">
+              <el-descriptions-item label="簇电压">{{ detail.info.voltage }} V</el-descriptions-item>
+              <el-descriptions-item label="簇电流">{{ detail.info.current }} A</el-descriptions-item>
+              <el-descriptions-item label="绝缘电阻">{{ detail.info.insulation }} kΩ</el-descriptions-item>
+              <el-descriptions-item label="功率">{{ detail.info.power }} kW</el-descriptions-item>
+              <el-descriptions-item label="日充放电">{{ detail.info.dailyEnergy }} MWh</el-descriptions-item>
+              <el-descriptions-item label="断路器">{{ detail.info.breakerStatus }}</el-descriptions-item>
+            </el-descriptions>
+          </template>
+
+          <template v-if="detail.type === 'pack'">
+            <el-descriptions :column="3" border class="desc">
+              <el-descriptions-item label="PACK 电压">{{ detail.info.voltage }} V</el-descriptions-item>
+              <el-descriptions-item label="PACK 电流">{{ detail.info.current }} A</el-descriptions-item>
+              <el-descriptions-item label="最高温度">{{ detail.info.temperatureMax }} ℃</el-descriptions-item>
+              <el-descriptions-item label="最低温度">{{ detail.info.temperatureMin }} ℃</el-descriptions-item>
+              <el-descriptions-item label="电芯最高">{{ detail.info.cellVoltageMax }} V</el-descriptions-item>
+              <el-descriptions-item label="电芯最低">{{ detail.info.cellVoltageMin }} V</el-descriptions-item>
+              <el-descriptions-item label="SOC">{{ detail.info.soc }} %</el-descriptions-item>
+              <el-descriptions-item label="SOH">{{ detail.info.soh }} %</el-descriptions-item>
+              <el-descriptions-item label="绝缘电阻">{{ detail.info.insulation }} kΩ</el-descriptions-item>
+              <el-descriptions-item label="故障代码">{{ detail.info.faultCode }}</el-descriptions-item>
+            </el-descriptions>
+          </template>
+        </div>
+      </el-tab-pane>
+
+      <el-tab-pane name="history">
+        <template #label>
+          <span class="t-l"><el-icon><DataLine /></el-icon> 历史曲线</span>
+        </template>
+        <div class="tp">
+          <div class="trend-head">
+            <el-radio-group v-model="histRange" size="small">
+              <el-radio-button label="24h">近 24 小时</el-radio-button>
+              <el-radio-button label="7d">近 7 天</el-radio-button>
+              <el-radio-button label="30d">近 30 天</el-radio-button>
+            </el-radio-group>
+            <div class="th-right">
+              <el-button size="small" :icon="Refresh" @click="renderTrend">刷新</el-button>
+              <el-button size="small" :icon="Document">导出 CSV</el-button>
+            </div>
+          </div>
+          <div class="trend-chart" ref="trendEl" />
+          <div class="trend-summary">
+            <div class="ts-item">
+              <span class="ts-l">数据点数</span>
+              <span class="ts-v">{{ histRange === '24h' ? 96 : histRange === '7d' ? 84 : 90 }}</span>
+            </div>
+            <div class="ts-item">
+              <span class="ts-l">采样频率</span>
+              <span class="ts-v">{{ histRange === '24h' ? '15 分钟' : histRange === '7d' ? '2 小时' : '8 小时' }}</span>
+            </div>
+            <div class="ts-item">
+              <span class="ts-l">数据完整率</span>
+              <span class="ts-v ok">99.8%</span>
+            </div>
+            <div class="ts-item">
+              <span class="ts-l">数据来源</span>
+              <span class="ts-v">BMS · OPC UA · MQTT</span>
+            </div>
+          </div>
+        </div>
+      </el-tab-pane>
+
+      <el-tab-pane name="dist">
+        <template #label>
+          <span class="t-l"><el-icon><Histogram /></el-icon> 单体分布</span>
+        </template>
+        <div class="tp">
+          <div class="dist-kpis">
+            <div class="dk"><div class="dk-l">单元数</div><div class="dk-v">{{ distStats.count }}</div></div>
+            <div class="dk"><div class="dk-l">最大值</div><div class="dk-v" style="color:#06b6d4">{{ distStats.max }}</div></div>
+            <div class="dk"><div class="dk-l">最小值</div><div class="dk-v" style="color:#ef4444">{{ distStats.min }}</div></div>
+            <div class="dk"><div class="dk-l">平均值</div><div class="dk-v">{{ distStats.avg }}</div></div>
+            <div class="dk"><div class="dk-l">极差</div><div class="dk-v" style="color:#f59e0b">{{ distStats.delta }} <small>{{ distStats.unit }}</small></div></div>
+          </div>
+          <div class="dist-chart" ref="distEl" />
+          <div class="dist-legend">
+            <span><i style="background:#ef4444" />显著偏低</span>
+            <span><i style="background:#f59e0b" />偏低预警</span>
+            <span><i style="background:#015eea" />正常</span>
+            <span><i style="background:#06b6d4" />偏高</span>
+            <span><i style="background:#22d3a0" />均值参考线</span>
+          </div>
+        </div>
+      </el-tab-pane>
+
+      <el-tab-pane name="events">
+        <template #label>
+          <span class="t-l"><el-icon><List /></el-icon> 事件日志</span>
+        </template>
+        <div class="tp">
+          <div class="ev-list">
+            <div class="ev-item" v-for="(e, i) in events" :key="i" :class="e.t">
+              <div class="ev-dot">{{ e.icon }}</div>
+              <div class="ev-body">
+                <div class="ev-head">
+                  <span class="ev-title">{{ e.title }}</span>
+                  <el-tag size="small"
+                    :type="e.t === 'err' ? 'danger' : e.t === 'warn' ? 'warning' : e.t === 'ok' ? 'success' : 'info'"
+                  >{{ e.status }}</el-tag>
+                </div>
+                <div class="ev-desc">{{ e.desc }}</div>
+                <div class="ev-time">{{ e.time }}</div>
+              </div>
+            </div>
+            <div class="ev-empty" v-if="events.length === 0">暂无事件记录</div>
+          </div>
+        </div>
+      </el-tab-pane>
+    </el-tabs>
+  </div>
+</template>
+
+<style lang="scss" scoped>
+@use '@/styles/variables.scss' as *;
+
+.dt { width: 100%; }
+.dt-tabs {
+  :deep(.el-tabs__nav-wrap::after) { background-color: $border-soft; }
+  :deep(.el-tabs__item) { font-size: 14px; height: 44px; line-height: 44px; }
+}
+.t-l { display: inline-flex; align-items: center; gap: 6px; }
+
+.tp { padding: 8px 0; }
+
+/* === 实时 === */
+.desc { margin-bottom: 20px; }
+.sub-title { font-size: 14px; font-weight: 600; margin: 14px 0 12px; color: $text-secondary; }
+.hierarchy {
+  display: flex; align-items: center; gap: 14px;
+  background: $bg-soft; border-radius: $radius; padding: 18px 24px;
+}
+.hi-item { display: flex; align-items: center; gap: 10px; }
+.hi-icon {
+  width: 36px; height: 36px; border-radius: 8px; color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700;
+}
+.hi-l { font-size: 12px; color: $text-muted; }
+.hi-v { font-size: 18px; font-weight: 600; }
+.hi-arrow { color: $text-muted; font-size: 18px; }
+
+/* === 历史 === */
+.trend-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.th-right { display: flex; gap: 8px; }
+.trend-chart { width: 100%; height: 360px; }
+.trend-summary {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px;
+  margin-top: 16px; padding-top: 16px; border-top: 1px solid $border-soft;
+}
+.ts-item { display: flex; flex-direction: column; gap: 4px; }
+.ts-l { font-size: 12px; color: $text-muted; }
+.ts-v { font-size: 14px; font-weight: 500; }
+.ts-v.ok { color: #22d3a0; }
+
+/* === 单体分布 === */
+.dist-kpis { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin-bottom: 14px; }
+.dk { background: $bg-soft; border-radius: 8px; padding: 12px 16px; }
+.dk-l { font-size: 12px; color: $text-muted; }
+.dk-v {
+  font-family: $font-num;
+  font-variant-numeric: tabular-nums lining-nums;
+  font-size: 20px; font-weight: 600; margin-top: 4px;
+  small { font-size: 12px; color: $text-muted; font-weight: 400; }
+}
+.dist-chart { width: 100%; height: 320px; }
+.dist-legend {
+  display: flex; gap: 16px; flex-wrap: wrap;
+  margin-top: 12px; padding-top: 12px; border-top: 1px solid $border-soft;
+  font-size: 12px; color: $text-secondary;
+  span { display: inline-flex; align-items: center; gap: 6px; }
+  i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+}
+
+/* === 事件 === */
+.ev-list { display: flex; flex-direction: column; gap: 8px; padding: 4px 0; }
+.ev-item {
+  display: flex; gap: 14px; padding: 14px 16px;
+  background: $bg-card; border: 1px solid $border-soft; border-radius: $radius;
+  border-left-width: 3px;
+  transition: transform 0.15s, box-shadow 0.15s;
+  &:hover { transform: translateX(2px); box-shadow: $shadow-card; }
+  &.err { border-left-color: #ef4444; }
+  &.warn { border-left-color: #f59e0b; }
+  &.ok { border-left-color: #22d3a0; }
+  &.info { border-left-color: #015eea; }
+}
+.ev-dot {
+  width: 28px; height: 28px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; font-weight: 700; color: #fff;
+  flex-shrink: 0;
+  .err & { background: #ef4444; }
+  .warn & { background: #f59e0b; }
+  .ok & { background: #22d3a0; }
+  .info & { background: #015eea; }
+}
+.ev-item.err .ev-dot { background: #ef4444; }
+.ev-item.warn .ev-dot { background: #f59e0b; }
+.ev-item.ok .ev-dot { background: #22d3a0; }
+.ev-item.info .ev-dot { background: #015eea; }
+.ev-body { flex: 1; min-width: 0; }
+.ev-head { display: flex; justify-content: space-between; align-items: center; }
+.ev-title { font-size: 14px; font-weight: 600; }
+.ev-desc { font-size: 13px; color: $text-secondary; margin-top: 4px; line-height: 1.6; }
+.ev-time { font-size: 11px; color: $text-muted; margin-top: 6px; font-family: $font-num; }
+.ev-empty { padding: 40px; text-align: center; color: $text-muted; }
+
+@media (max-width: 1100px) {
+  .trend-summary, .dist-kpis { grid-template-columns: repeat(2, 1fr); }
+}
+</style>

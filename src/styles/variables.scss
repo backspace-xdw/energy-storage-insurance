@@ -1,0 +1,45 @@
+// === aisafer 风格色板 ===
+$nav-bg: #10152e;          // 顶部深蓝紫
+$nav-bg-2: #0f152f;
+$brand-blue: #015eea;       // 主蓝
+$brand-blue-dark: #1e2188;  // 深蓝
+$brand-cyan: #06b6d4;       // 强调青
+$brand-cyan-2: #07a7c4;
+$accent-indigo: #6366f1;
+
+$text-primary: #1a1f36;
+$text-secondary: #525c75;
+$text-muted: #8a93a8;
+$text-on-dark: #ffffff;
+$text-on-dark-soft: rgba(255, 255, 255, 0.72);
+
+$bg-page: #f5f7fb;
+$bg-card: #ffffff;
+$bg-soft: #f5f5fe;
+$border-soft: #e7eaf3;
+
+// 渐变
+$grad-hero: linear-gradient(135deg, #10152e 0%, #1e2188 55%, #015eea 100%);
+$grad-cyan: linear-gradient(135deg, #06b6d4 0%, #015eea 100%);
+$grad-card: linear-gradient(135deg, #ffffff 0%, #f5f5fe 100%);
+
+// 阴影
+$shadow-card: 0 4px 24px rgba(16, 21, 46, 0.06);
+$shadow-card-hover: 0 8px 32px rgba(16, 21, 46, 0.12);
+
+// 字体 —— 系统字体优先，确保各平台都清晰渲染
+$font-cn: "PingFang SC", "Microsoft YaHei", "Hiragino Sans GB",
+  -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI",
+  system-ui, "Helvetica Neue", Roboto, "Noto Sans SC", Arial, sans-serif;
+
+// 数字 / 字母字体栈（用于 KPI 数字、得分、时间戳等强调位置）
+$font-num: "SF Pro Display", "Segoe UI Variable", -apple-system,
+  BlinkMacSystemFont, "Helvetica Neue", "Inter", system-ui, Arial, sans-serif;
+
+// 装饰大数字（仅用于背景超大数字角标，已避免使用 light/extralight 这类系统不一定带的字重）
+$font-deco: $font-num;
+
+// 圆角
+$radius-sm: 6px;
+$radius: 10px;
+$radius-lg: 16px;
