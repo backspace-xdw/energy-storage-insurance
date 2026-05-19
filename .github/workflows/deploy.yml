@@ -1,0 +1,108 @@
+name: CD · Deploy to ljinvestment :50000/esi/
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - 'LICENSE'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: '手动触发原因'
+        required: false
+        default: '手动重新部署'
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Pull → Build → Verify
+    runs-on: self-hosted
+    timeout-minutes: 10
+
+    env:
+      PROJECT_DIR: /home/shenzheng/XDW/energy-storage-insurance
+      ESI_URL: http://localhost:50000/esi/
+      LFWLW_URL: http://localhost:50000/
+
+    steps:
+      - name: Show context
+        run: |
+          echo "→ trigger: ${{ github.event_name }}"
+          echo "→ ref: ${{ github.ref }}"
+          echo "→ sha: ${{ github.sha }}"
+          echo "→ actor: ${{ github.actor }}"
+          [ -n "${{ github.event.inputs.reason }}" ] && echo "→ reason: ${{ github.event.inputs.reason }}"
+
+      - name: Sync source to ${{ env.PROJECT_DIR }}
+        run: |
+          cd "$PROJECT_DIR"
+          echo "→ git fetch"
+          git fetch origin main
+          OLD=$(git rev-parse --short HEAD)
+          echo "→ git reset --hard origin/main"
+          git reset --hard origin/main
+          NEW=$(git rev-parse --short HEAD)
+          echo "→ ${OLD} → ${NEW}"
+          echo "--- 本次变更 ---"
+          git log --oneline "${OLD}..${NEW}" || true
+
+      - name: Install dependencies (npm ci)
+        run: |
+          cd "$PROJECT_DIR"
+          npm ci --no-audit --no-fund
+
+      - name: Build production bundle
+        run: |
+          cd "$PROJECT_DIR"
+          npm run build
+          echo "--- dist 产物 ---"
+          ls -lah dist/ | head -10
+          du -sh dist/
+
+      - name: Verify ESI is reachable (HTTP 200)
+        run: |
+          # 等 1 秒让文件系统缓存稳定
+          sleep 1
+          HTTP=$(curl -s -o /dev/null -w '%{http_code}' "$ESI_URL")
+          echo "GET $ESI_URL → HTTP $HTTP"
+          if [ "$HTTP" != "200" ]; then
+            echo "✗ /esi/ 返回 $HTTP，部署失败"
+            exit 1
+          fi
+          ASSET=$(grep -o '/esi/assets/index-[A-Za-z0-9_-]*\.js' "$PROJECT_DIR/dist/index.html" | head -1)
+          if [ -n "$ASSET" ]; then
+            AHTTP=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:50000${ASSET}")
+            echo "GET ${ASSET} → HTTP $AHTTP"
+            [ "$AHTTP" = "200" ] || { echo "✗ 资源 $ASSET 未命中"; exit 1; }
+          fi
+
+      - name: Verify LFWLW main site not affected
+        run: |
+          HTTP=$(curl -s -o /dev/null -w '%{http_code}' "$LFWLW_URL")
+          echo "GET $LFWLW_URL → HTTP $HTTP"
+          [ "$HTTP" = "200" ] || { echo "✗ LFWLW 主站受影响"; exit 1; }
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "✓ 部署成功"
+          echo "  公网: http://ljinvestment.diskstation.me:50000/esi/"
+          echo "  本机: $ESI_URL"
+          echo "  commit: $(cd "$PROJECT_DIR" && git rev-parse --short HEAD)"
+
+      - name: On failure - print diagnostics
+        if: failure()
+        run: |
+          echo "=== 当前 commit ==="
+          cd "$PROJECT_DIR" && git log --oneline -3
+          echo ""
+          echo "=== dist/ ==="
+          ls -la "$PROJECT_DIR/dist/" 2>&1 | head -10
+          echo ""
+          echo "=== 软链状态 ==="
+          ls -la /home/shenzheng/lfwlw/frontend/dist/esi 2>&1
