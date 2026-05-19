@@ -37,7 +37,9 @@ jobs:
           echo "→ ref: ${{ github.ref }}"
           echo "→ sha: ${{ github.sha }}"
           echo "→ actor: ${{ github.actor }}"
-          [ -n "${{ github.event.inputs.reason }}" ] && echo "→ reason: ${{ github.event.inputs.reason }}"
+          if [ -n "${{ github.event.inputs.reason }}" ]; then
+            echo "→ reason: ${{ github.event.inputs.reason }}"
+          fi
 
       - name: Sync source to ${{ env.PROJECT_DIR }}
         run: |
