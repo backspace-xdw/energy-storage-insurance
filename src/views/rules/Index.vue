@@ -1,11 +1,12 @@
 <script setup>
-import { ref, reactive, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import dayjs from 'dayjs'
 import PageHeader from '@/components/PageHeader.vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  Plus, Edit, Delete, MagicStick, View, CopyDocument,
-  CircleCheckFilled, Setting, Bell, Message
+  Plus, Delete, MagicStick, CopyDocument, Document,
+  CircleCheckFilled, Setting, Bell, Message, Warning,
+  RefreshLeft, Check, DocumentCopy
 } from '@element-plus/icons-vue'
 
 /* ---------- 字段、运算符、动作 ---------- */
@@ -133,6 +134,70 @@ const rules = ref([
   }
 ])
 
+/* ---------- 规则模板库 ---------- */
+const TEMPLATES = [
+  {
+    name: '热失控早期预警', level: 'crit', logic: 'AND', cooldown: 60,
+    desc: 'PACK 温度与压差同时异常时触发，覆盖热失控早期信号',
+    conditions: [
+      { metric: 'pack.temperature_max', op: '>', value: 45, duration: 0 },
+      { metric: 'pack.voltage_delta', op: '>', value: 50, duration: 30 }
+    ],
+    actions: ['inApp', 'sms', 'workOrder', 'autoLock']
+  },
+  {
+    name: '绝缘电阻下降', level: 'warn', logic: 'AND', cooldown: 300,
+    desc: '簇级绝缘持续低于安全阈值，疑似漏电',
+    conditions: [{ metric: 'cluster.insulation', op: '<', value: 500, duration: 60 }],
+    actions: ['inApp', 'email', 'workOrder']
+  },
+  {
+    name: '烟雾 / 氢气复合预警', level: 'crit', logic: 'OR', cooldown: 30,
+    desc: '舱内烟雾或氢气任一超标即刻报警',
+    conditions: [
+      { metric: 'cabin.smoke', op: '>', value: 2.5, duration: 0 },
+      { metric: 'cabin.h2', op: '>', value: 200, duration: 0 }
+    ],
+    actions: ['inApp', 'sms', 'email', 'workOrder', 'autoLock']
+  },
+  {
+    name: 'SOC 越限', level: 'norm', logic: 'OR', cooldown: 30,
+    desc: 'SOC 越上下限风险预警',
+    conditions: [
+      { metric: 'pack.soc', op: '<', value: 5, duration: 60 },
+      { metric: 'pack.soc', op: '>', value: 98, duration: 60 }
+    ],
+    actions: ['inApp']
+  },
+  {
+    name: 'SOH 月度衰减异常', level: 'warn', logic: 'AND', cooldown: 0,
+    desc: '健康度月度衰减超过 1%',
+    conditions: [{ metric: 'pack.soh', op: 'change', value: -1, duration: 2592000 }],
+    actions: ['inApp', 'email']
+  },
+  {
+    name: 'IGBT 过温', level: 'norm', logic: 'AND', cooldown: 120,
+    desc: 'PCS IGBT 温度持续偏高',
+    conditions: [{ metric: 'pcs.igbt_temp', op: '>', value: 75, duration: 30 }],
+    actions: ['inApp']
+  },
+  {
+    name: '消防设施告警', level: 'crit', logic: 'OR', cooldown: 60,
+    desc: '消防探测器报警或灭火剂压力异常',
+    conditions: [
+      { metric: 'fire.detector_alarm', op: '>', value: 0, duration: 0 },
+      { metric: 'fire.gas_pressure', op: '<', value: 10, duration: 60 }
+    ],
+    actions: ['inApp', 'sms', 'workOrder']
+  },
+  {
+    name: 'PCS 转换效率劣化', level: 'info', logic: 'AND', cooldown: 600,
+    desc: '转换效率连续低于 95%，需排查 PCS 健康',
+    conditions: [{ metric: 'pcs.efficiency', op: '<', value: 95, duration: 300 }],
+    actions: ['inApp', 'email']
+  }
+]
+
 /* ---------- 当前编辑 ---------- */
 const selectedId = ref('R-001')
 const selectedRule = computed(() => rules.value.find(r => r.id === selectedId.value))
@@ -147,15 +212,133 @@ const filtered = computed(() =>
     (filterEnabled.value === '' || r.enabled === (filterEnabled.value === 'on'))
   )
 )
+const hasFilter = computed(() => !!(search.value || filterLevel.value || filterEnabled.value))
+function clearFilters() {
+  search.value = ''
+  filterLevel.value = ''
+  filterEnabled.value = ''
+}
+
+/* ---------- Dirty 跟踪 ---------- */
+const snapshots = ref({})
+const EDITABLE_FIELDS = ['name', 'desc', 'level', 'logic', 'cooldown', 'conditions', 'actions']
+function snapshot(rule) {
+  if (!rule) return ''
+  return JSON.stringify(EDITABLE_FIELDS.reduce((o, k) => (o[k] = rule[k], o), {}))
+}
+function commit(rule) {
+  if (rule) snapshots.value[rule.id] = snapshot(rule)
+}
+function isDirty(rule) {
+  if (!rule) return false
+  return snapshots.value[rule.id] !== undefined && snapshots.value[rule.id] !== snapshot(rule)
+}
+const currentDirty = computed(() => isDirty(selectedRule.value))
+// 初始化 snapshots
+rules.value.forEach(r => commit(r))
+
+function saveCurrent() {
+  if (!selectedRule.value) return
+  commit(selectedRule.value)
+  ElMessage.success(`规则 ${selectedRule.value.name} 已保存`)
+}
+function discardCurrent() {
+  if (!selectedRule.value) return
+  const snap = snapshots.value[selectedRule.value.id]
+  if (!snap) return
+  const orig = JSON.parse(snap)
+  Object.assign(selectedRule.value, orig)
+  ElMessage.info('已放弃改动')
+}
+async function trySwitch(id) {
+  if (currentDirty.value && id !== selectedId.value) {
+    try {
+      await ElMessageBox.confirm(
+        `规则 "${selectedRule.value.name}" 有未保存的改动，是否丢弃？`,
+        '未保存改动', { type: 'warning', confirmButtonText: '丢弃改动', cancelButtonText: '继续编辑' }
+      )
+      discardCurrent()
+    } catch { return }
+  }
+  selectedId.value = id
+}
+
+/* ---------- 冲突检测 ---------- */
+const conflicts = computed(() => {
+  const cur = selectedRule.value
+  if (!cur) return []
+  const out = []
+  rules.value.forEach(other => {
+    if (other.id === cur.id || !other.enabled) return
+    cur.conditions.forEach(c1 => {
+      other.conditions.forEach(c2 => {
+        if (c1.metric !== c2.metric) return
+        const sameDir = (c1.op[0] === c2.op[0]) // > >= or < <=
+        if (sameDir && Math.abs(c1.value - c2.value) < Math.max(1, Math.abs(c1.value) * 0.15)) {
+          out.push({ otherId: other.id, otherName: other.name, metric: c1.metric, v1: c1.value, v2: c2.value })
+        }
+      })
+    })
+  })
+  // 去重
+  const seen = new Set()
+  return out.filter(o => {
+    const k = o.otherId + ':' + o.metric
+    if (seen.has(k)) return false
+    seen.add(k); return true
+  })
+})
+
+/* ---------- 模板选择对话框 ---------- */
+const tplDialog = ref(false)
+function openTemplatePicker() { tplDialog.value = true }
+function createFromTemplate(tpl) {
+  const id = 'R-' + String(rules.value.length + 1).padStart(3, '0')
+  const n = {
+    id, name: tpl ? tpl.name : '新规则',
+    desc: tpl ? tpl.desc : '',
+    enabled: false, hits24h: 0, hits7d: 0, lastHit: '—',
+    level: tpl ? tpl.level : 'norm',
+    logic: tpl ? tpl.logic : 'AND',
+    cooldown: tpl ? tpl.cooldown : 60,
+    conditions: tpl ? JSON.parse(JSON.stringify(tpl.conditions)) : [{ metric: METRICS[0].key, op: '>', value: 0, duration: 0 }],
+    actions: tpl ? [...tpl.actions] : ['inApp']
+  }
+  rules.value.unshift(n)
+  commit(n)
+  selectedId.value = id
+  tplDialog.value = false
+  ElMessage.success(tpl ? `已基于模板「${tpl.name}」创建规则` : '已创建空白规则')
+}
+
+/* ---------- JSON 视图 ---------- */
+const jsonDialog = ref(false)
+const jsonText = computed(() => {
+  if (!selectedRule.value) return ''
+  const r = selectedRule.value
+  return JSON.stringify({
+    id: r.id, name: r.name, desc: r.desc, enabled: r.enabled,
+    level: r.level, logic: r.logic, cooldown: r.cooldown,
+    conditions: r.conditions, actions: r.actions
+  }, null, 2)
+})
+async function copyJson() {
+  try {
+    await navigator.clipboard.writeText(jsonText.value)
+    ElMessage.success('已复制到剪贴板')
+  } catch {
+    ElMessage.error('复制失败：请手动选择文本复制')
+  }
+}
 
 /* ---------- 增删改 ---------- */
-function toggleEnable(r) { r.enabled = !r.enabled; ElMessage.success(`规则 ${r.name} 已${r.enabled?'启用':'停用'}`) }
 function dupRule(r) {
   const n = JSON.parse(JSON.stringify(r))
   n.id = 'R-' + String(rules.value.length + 1).padStart(3, '0')
   n.name = r.name + ' (副本)'
   n.hits24h = 0; n.hits7d = 0; n.lastHit = '—'
   rules.value.push(n)
+  commit(n)
   selectedId.value = n.id
   ElMessage.success('已复制规则')
 }
@@ -163,6 +346,7 @@ async function deleteRule(r) {
   try {
     await ElMessageBox.confirm(`确认删除规则 "${r.name}"？`, '删除规则', { type: 'warning' })
     rules.value = rules.value.filter(x => x.id !== r.id)
+    delete snapshots.value[r.id]
     if (selectedId.value === r.id) selectedId.value = rules.value[0]?.id
     ElMessage.success('已删除')
   } catch {}
@@ -173,15 +357,21 @@ function addCondition() {
 function removeCondition(i) {
   selectedRule.value.conditions.splice(i, 1)
 }
-function addRule() {
-  const n = {
-    id: 'R-' + String(rules.value.length + 1).padStart(3, '0'),
-    name: '新规则', desc: '', enabled: false, hits24h: 0, hits7d: 0, lastHit: '—',
-    level: 'norm', logic: 'AND', cooldown: 60,
-    conditions: [{ metric: METRICS[0].key, op: '>', value: 0, duration: 0 }],
-    actions: ['inApp']
+
+/* ---------- 动作切换：高危二次确认 ---------- */
+const DANGEROUS_ACTIONS = ['autoLock']
+async function toggleAction(key) {
+  const r = selectedRule.value
+  const has = r.actions.includes(key)
+  if (!has && DANGEROUS_ACTIONS.includes(key)) {
+    try {
+      await ElMessageBox.confirm(
+        `"${getActionMeta(key).label}" 会向储能站下发远程操作指令，可能影响业务运行。确认启用？`,
+        '高危动作确认', { type: 'warning', confirmButtonText: '启用', cancelButtonText: '取消' }
+      )
+    } catch { return }
   }
-  rules.value.unshift(n); selectedId.value = n.id
+  r.actions = has ? r.actions.filter(x => x !== key) : [...r.actions, key]
 }
 
 /* ---------- 模拟测试 ---------- */
@@ -227,7 +417,7 @@ function getActionMeta(key) { return ACTIONS.find(a => a.key === key) }
     >
       <template #actions>
         <el-button :icon="MagicStick" @click="simulate">模拟测试</el-button>
-        <el-button type="primary" :icon="Plus" @click="addRule">新建规则</el-button>
+        <el-button type="primary" :icon="Plus" @click="openTemplatePicker">新建规则</el-button>
       </template>
     </PageHeader>
 
@@ -277,23 +467,29 @@ function getActionMeta(key) { return ACTIONS.find(a => a.key === key) }
           </el-select>
         </div>
 
-        <div class="ls-items">
+        <div class="ls-items" v-if="filtered.length">
           <div
             v-for="r in filtered" :key="r.id"
             class="ls-item"
-            :class="{ active: selectedId === r.id }"
-            @click="selectedId = r.id"
+            :class="['lv-' + r.level, { active: selectedId === r.id, dirty: isDirty(r) }]"
+            @click="trySwitch(r.id)"
           >
             <div class="li-head">
               <span class="li-id">{{ r.id }}</span>
+              <span class="li-dirty" v-if="isDirty(r)" title="未保存改动">●</span>
               <el-switch v-model="r.enabled" size="small" @click.stop />
             </div>
             <div class="li-name">{{ r.name }}</div>
             <div class="li-meta">
               <span class="li-lv" :style="{ color: getLevelMeta(r.level).color, background: getLevelMeta(r.level).color + '22' }">{{ getLevelMeta(r.level).label }}</span>
               <span class="li-cnt">7d {{ r.hits7d }} 次</span>
+              <span class="li-hot" v-if="r.hits24h > 0" :title="`24h 内命中 ${r.hits24h} 次`">{{ r.hits24h }}</span>
             </div>
           </div>
+        </div>
+        <div class="ls-empty" v-else>
+          <div>无匹配规则</div>
+          <el-button v-if="hasFilter" text type="primary" size="small" @click="clearFilters">清空筛选</el-button>
         </div>
       </div>
 
@@ -303,14 +499,43 @@ function getActionMeta(key) { return ACTIONS.find(a => a.key === key) }
           <div class="ed-left">
             <input v-model="selectedRule.name" class="ed-name" />
             <div class="ed-id">{{ selectedRule.id }}</div>
+            <span class="ed-dirty" v-if="currentDirty">● 未保存</span>
           </div>
           <div class="ed-actions">
+            <el-button :icon="Document" @click="jsonDialog = true">JSON</el-button>
             <el-button :icon="MagicStick" @click="simulate">模拟测试</el-button>
             <el-button :icon="CopyDocument" @click="dupRule(selectedRule)">复制</el-button>
             <el-button :icon="Delete" type="danger" plain @click="deleteRule(selectedRule)">删除</el-button>
-            <el-button type="primary">保存规则</el-button>
+            <el-button
+              :icon="RefreshLeft"
+              :disabled="!currentDirty"
+              @click="discardCurrent"
+            >放弃</el-button>
+            <el-button
+              type="primary"
+              :icon="Check"
+              :disabled="!currentDirty"
+              @click="saveCurrent"
+            >保存规则</el-button>
           </div>
         </div>
+
+        <!-- 冲突提示 -->
+        <el-alert
+          v-if="conflicts.length"
+          type="warning" :closable="false" show-icon
+          class="ed-alert"
+          :title="`检测到 ${conflicts.length} 条规则与本规则在相同字段同方向触发，可能产生重复告警`"
+        >
+          <template #default>
+            <div class="conflict-list">
+              <span v-for="(c, i) in conflicts" :key="i" class="cf-item">
+                <b>{{ c.otherId }}</b> {{ c.otherName }}
+                <span class="cf-meta">· {{ getMetricMeta(c.metric).label }} 阈值 {{ c.v2 }}</span>
+              </span>
+            </div>
+          </template>
+        </el-alert>
 
         <!-- 描述 -->
         <div class="form">
@@ -344,8 +569,8 @@ function getActionMeta(key) { return ACTIONS.find(a => a.key === key) }
             <div class="bl-title">触发条件</div>
             <div class="bl-tools">
               <el-radio-group v-model="selectedRule.logic" size="small">
-                <el-radio-button label="AND">全部满足 AND</el-radio-button>
-                <el-radio-button label="OR">任一满足 OR</el-radio-button>
+                <el-radio-button value="AND">全部满足 AND</el-radio-button>
+                <el-radio-button value="OR">任一满足 OR</el-radio-button>
               </el-radio-group>
               <el-button :icon="Plus" size="small" @click="addCondition">添加条件</el-button>
             </div>
@@ -382,11 +607,12 @@ function getActionMeta(key) { return ACTIONS.find(a => a.key === key) }
             <button
               v-for="a in ACTIONS" :key="a.key"
               class="act"
-              :class="{ active: selectedRule.actions.includes(a.key) }"
-              @click="selectedRule.actions = selectedRule.actions.includes(a.key) ? selectedRule.actions.filter(x => x !== a.key) : [...selectedRule.actions, a.key]"
+              :class="{ active: selectedRule.actions.includes(a.key), danger: DANGEROUS_ACTIONS.includes(a.key) }"
+              @click="toggleAction(a.key)"
             >
               <el-icon><component :is="a.icon" /></el-icon>
               <span>{{ a.label }}</span>
+              <el-icon class="warn-icon" v-if="DANGEROUS_ACTIONS.includes(a.key)"><Warning /></el-icon>
               <el-icon class="check" v-if="selectedRule.actions.includes(a.key)"><CircleCheckFilled /></el-icon>
             </button>
           </div>
@@ -431,6 +657,47 @@ function getActionMeta(key) { return ACTIONS.find(a => a.key === key) }
         </div>
       </div>
     </div>
+
+    <!-- 模板选择对话框 -->
+    <el-dialog v-model="tplDialog" title="选择规则模板" width="780">
+      <div class="tpl-tip">基于行业最佳实践 · 选择后可在编辑器内继续调整</div>
+      <div class="tpl-grid">
+        <button class="tpl blank" @click="createFromTemplate(null)">
+          <el-icon><Plus /></el-icon>
+          <div class="tpl-name">空白规则</div>
+          <div class="tpl-desc">从零开始配置触发条件与动作</div>
+        </button>
+        <button
+          v-for="tpl in TEMPLATES" :key="tpl.name"
+          class="tpl"
+          :class="'lv-' + tpl.level"
+          @click="createFromTemplate(tpl)"
+        >
+          <div class="tpl-top">
+            <span class="tpl-lv" :style="{ color: getLevelMeta(tpl.level).color, background: getLevelMeta(tpl.level).color + '22' }">{{ getLevelMeta(tpl.level).label }}</span>
+            <span class="tpl-cnd">{{ tpl.conditions.length }} 条件</span>
+          </div>
+          <div class="tpl-name">{{ tpl.name }}</div>
+          <div class="tpl-desc">{{ tpl.desc }}</div>
+          <div class="tpl-actions">
+            <el-icon v-for="ak in tpl.actions" :key="ak" :title="getActionMeta(ak).label">
+              <component :is="getActionMeta(ak).icon" />
+            </el-icon>
+          </div>
+        </button>
+      </div>
+    </el-dialog>
+
+    <!-- JSON 视图 -->
+    <el-drawer v-model="jsonDialog" title="规则 JSON" size="560" direction="rtl">
+      <div class="json-wrap">
+        <div class="json-toolbar">
+          <span class="json-id">{{ selectedRule?.id }} · {{ selectedRule?.name }}</span>
+          <el-button :icon="DocumentCopy" size="small" type="primary" plain @click="copyJson">复制</el-button>
+        </div>
+        <pre class="json-body">{{ jsonText }}</pre>
+      </div>
+    </el-drawer>
   </div>
 </template>
 
@@ -465,15 +732,39 @@ function getActionMeta(key) { return ACTIONS.find(a => a.key === key) }
   padding: 12px; border-radius: 8px; cursor: pointer; margin-bottom: 6px;
   border: 1px solid transparent;
   transition: all 0.15s;
+  position: relative;
+  border-left-width: 3px;
   &:hover { background: $bg-soft; }
-  &.active { background: rgba(1, 94, 234, 0.05); border-color: rgba(1, 94, 234, 0.2); }
+  &.active { background: rgba(1, 94, 234, 0.05); border-color: rgba(1, 94, 234, 0.2); border-left-color: $brand-blue; }
+  &.lv-crit { border-left-color: #ef4444; }
+  &.lv-warn { border-left-color: #f59e0b; }
+  &.lv-norm { border-left-color: #06b6d4; }
+  &.lv-info { border-left-color: #6366f1; }
 }
-.li-head { display: flex; justify-content: space-between; align-items: center; }
-.li-id { font-family: $font-num; font-size: 11px; color: $text-muted; }
+.ls-empty { padding: 32px 0; text-align: center; color: $text-muted; font-size: 13px;
+  display: flex; flex-direction: column; gap: 8px; align-items: center;
+}
+.li-head { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+.li-id { font-family: $font-num; font-size: 11px; color: $text-muted; flex: 1; }
+.li-dirty { color: #f59e0b; font-size: 14px; line-height: 1; }
 .li-name { font-size: 13px; font-weight: 600; margin: 6px 0; }
 .li-meta { display: flex; gap: 8px; align-items: center; font-size: 11px; }
 .li-lv { padding: 2px 8px; border-radius: 4px; font-weight: 500; }
 .li-cnt { color: $text-muted; font-family: $font-num; }
+.li-hot {
+  margin-left: auto;
+  font-family: $font-num; font-weight: 700; font-size: 11px;
+  min-width: 22px; height: 18px; padding: 0 6px; border-radius: 9px;
+  background: #ef4444; color: #fff;
+  display: inline-flex; align-items: center; justify-content: center;
+  box-shadow: 0 0 0 0 rgba(239,68,68,0.6);
+  animation: pulse 1.8s infinite;
+}
+@keyframes pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(239,68,68,0.55); }
+  70%  { box-shadow: 0 0 0 6px rgba(239,68,68,0); }
+  100% { box-shadow: 0 0 0 0 rgba(239,68,68,0); }
+}
 
 /* === Editor === */
 .editor { padding: 20px 24px; }
@@ -483,7 +774,12 @@ function getActionMeta(key) { return ACTIONS.find(a => a.key === key) }
   &:focus { background: $bg-soft; box-shadow: 0 0 0 2px rgba(1,94,234,0.2); }
 }
 .ed-id { font-family: $font-num; font-size: 12px; color: $text-muted; padding: 2px 8px; background: $bg-soft; border-radius: 4px; }
-.ed-actions { display: flex; gap: 8px; }
+.ed-dirty { font-size: 12px; color: #f59e0b; font-weight: 500; padding: 2px 10px; background: rgba(245,158,11,0.1); border-radius: 10px; }
+.ed-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.ed-alert { margin-bottom: 14px; }
+.conflict-list { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; font-size: 12px; }
+.cf-item { color: $text-secondary; }
+.cf-meta { color: $text-muted; }
 
 .form { padding: 4px 0 16px; }
 .form-row { display: grid; grid-template-columns: 110px 1fr; align-items: center; gap: 16px; padding: 8px 0; }
@@ -546,7 +842,12 @@ function getActionMeta(key) { return ACTIONS.find(a => a.key === key) }
     border-color: $brand-blue;
     color: $brand-blue;
   }
+  &.danger {
+    &:hover { border-color: #ef4444; color: #ef4444; }
+    &.active { background: rgba(239,68,68,0.06); border-color: #ef4444; color: #ef4444; }
+  }
   .check { position: absolute; top: 4px; right: 4px; color: #22d3a0; font-size: 14px; }
+  .warn-icon { position: absolute; top: 4px; left: 4px; color: #f59e0b; font-size: 13px; }
   span { font-size: 12px; }
 }
 
@@ -570,11 +871,51 @@ function getActionMeta(key) { return ACTIONS.find(a => a.key === key) }
 .hg-l { font-size: 12px; color: $text-muted; }
 .hg-v { font-family: $font-num; font-variant-numeric: tabular-nums; font-size: 20px; font-weight: 600; margin-top: 4px; &.sm { font-size: 13px; font-weight: 500; } }
 
+/* === Template Dialog === */
+.tpl-tip { font-size: 12px; color: $text-muted; margin-bottom: 12px; }
+.tpl-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+.tpl {
+  background: $bg-card; border: 1.5px solid $border-soft; border-radius: 10px;
+  padding: 16px; cursor: pointer; transition: all 0.15s;
+  display: flex; flex-direction: column; gap: 6px; text-align: left;
+  border-left-width: 3px;
+  &:hover { border-color: $brand-blue; box-shadow: $shadow-card-hover; transform: translateY(-2px); }
+  &.lv-crit { border-left-color: #ef4444; }
+  &.lv-warn { border-left-color: #f59e0b; }
+  &.lv-norm { border-left-color: #06b6d4; }
+  &.lv-info { border-left-color: #6366f1; }
+  &.blank {
+    align-items: center; justify-content: center; text-align: center;
+    border-style: dashed; color: $text-muted;
+    .el-icon { font-size: 28px; margin-bottom: 4px; }
+  }
+}
+.tpl-top { display: flex; justify-content: space-between; align-items: center; }
+.tpl-lv { font-size: 11px; padding: 2px 8px; border-radius: 4px; font-weight: 500; }
+.tpl-cnd { font-size: 11px; color: $text-muted; }
+.tpl-name { font-size: 14px; font-weight: 600; color: $text-primary; }
+.tpl-desc { font-size: 12px; color: $text-secondary; line-height: 1.45; min-height: 32px; }
+.tpl-actions { display: flex; gap: 6px; color: $brand-blue; .el-icon { font-size: 14px; } }
+
+/* === JSON drawer === */
+.json-wrap { display: flex; flex-direction: column; gap: 12px; height: 100%; }
+.json-toolbar { display: flex; justify-content: space-between; align-items: center; }
+.json-id { font-size: 12px; color: $text-muted; font-family: $font-num; }
+.json-body {
+  flex: 1;
+  background: #10152e; color: #b3c5ff;
+  padding: 14px 16px; border-radius: 8px;
+  font-family: 'JetBrains Mono', Menlo, monospace; font-size: 12px; line-height: 1.6;
+  overflow: auto; margin: 0; white-space: pre;
+}
+
 @media (max-width: 1400px) {
   .kpi-row { grid-template-columns: repeat(3, 1fr); }
   .actions { grid-template-columns: repeat(3, 1fr); }
+  .tpl-grid { grid-template-columns: repeat(2, 1fr); }
 }
 @media (max-width: 1100px) {
   .layout { grid-template-columns: 1fr; }
+  .tpl-grid { grid-template-columns: 1fr; }
 }
 </style>

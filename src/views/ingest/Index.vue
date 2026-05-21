@@ -1,13 +1,15 @@
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount, reactive } from 'vue'
-import * as echarts from 'echarts'
+import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
+import echarts from '@/utils/echarts'
 import dayjs from 'dayjs'
 import PageHeader from '@/components/PageHeader.vue'
 import { stations } from '@/mock/data'
 import {
   Link, Connection, Refresh, Download, Search,
-  CircleCheckFilled, Warning, CloseBold, Clock
+  CircleCheckFilled, Warning, CloseBold, Clock,
+  VideoPause, VideoPlay
 } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 
 /* ===== 接口与协议配置 ===== */
 const PROTOCOLS = [
@@ -75,6 +77,36 @@ const filtered = computed(() =>
     (!search.value || i.station.includes(search.value) || i.name.includes(search.value) || i.port.includes(search.value))
   )
 )
+const hasFilter = computed(() => !!(filterStation.value || filterProto.value || filterStatus.value || search.value))
+function clearFilters() {
+  filterStation.value = ''
+  filterProto.value = ''
+  filterStatus.value = ''
+  search.value = ''
+}
+function rowClass({ row }) {
+  if (row.status === 'down') return 'row-down'
+  if (row.lossRate > 2) return 'row-warn'
+  return ''
+}
+
+const tableEl = ref(null)
+function scrollToTable() {
+  nextTick(() => {
+    tableEl.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  })
+}
+function applyProtoFilter(proto) {
+  filterProto.value = filterProto.value === proto ? '' : proto
+  scrollToTable()
+}
+function applyHeatFilter(station, ifaceName) {
+  filterStation.value = station.id
+  search.value = ifaceName
+  filterProto.value = ''
+  filterStatus.value = ''
+  scrollToTable()
+}
 
 /* ===== KPI ===== */
 const kpi = computed(() => {
@@ -168,6 +200,22 @@ function renderProto() {
   })
 }
 
+function bindProtoClick() {
+  protoChart.off('click')
+  protoChart.on('click', (p) => {
+    if (p.name) applyProtoFilter(p.name)
+  })
+}
+
+function bindHeatClick() {
+  heatChart.off('click')
+  heatChart.on('click', (p) => {
+    const iface = p.value?.[4]
+    const station = iface && stations.find(s => s.id === iface.sid)
+    if (iface && station) applyHeatFilter(station, iface.name)
+  })
+}
+
 function renderHeat() {
   // 站点 × 接口 × 状态颜色（24x6）
   const data = []
@@ -240,7 +288,9 @@ const tagsHealth = computed(() => {
 
 /* ===== 模拟实时刷新 ===== */
 let timer = null
+const live = ref(true)
 function tick() {
+  if (!live.value) return
   interfaces.value.forEach(i => {
     if (i.status !== 'down') {
       i.latency = Math.max(8, i.latency + (Math.random() - 0.5) * 6)
@@ -248,17 +298,117 @@ function tick() {
       i.last = dayjs().subtract(Math.floor(Math.random() * 3), 'second').format('HH:mm:ss')
     }
   })
+  // 详情抽屉打开时同步迷你图
+  if (drawerVisible.value && drawerIface.value) {
+    const cur = interfaces.value.find(i => i.id === drawerIface.value.id)
+    if (cur) {
+      drawerIface.value = cur
+      pushDrawerPoint(cur.framesPerSec)
+    }
+  }
 }
 function startTimer() { stopTimer(); timer = setInterval(tick, 1500) }
 function stopTimer() { if (timer) { clearInterval(timer); timer = null } }
+function toggleLive() {
+  live.value = !live.value
+  ElMessage.success(live.value ? '已恢复实时采集' : '已暂停实时采集')
+}
 
-function onResize() { flowChart?.resize(); protoChart?.resize(); heatChart?.resize() }
+/* ===== 详情抽屉 ===== */
+const drawerVisible = ref(false)
+const drawerIface = ref(null)
+const drawerHistory = ref([])     // 最近 60 个 framesPerSec 点
+const drawerEl = ref(null)
+let drawerChart = null
+const PAYLOAD_SAMPLES = {
+  'CAN-J1939': '{"id":"0CF00400","data":"FF FF 8A 7E 00 00 FF FF","sa":0,"pgn":61444}',
+  'Modbus':    '{"slave":1,"fn":3,"addr":40021,"qty":8,"resp":[16384,2031,...]}',
+  'OPC UA':    '{"node":"ns=2;s=Fire.Detector.07","val":0,"q":192,"src":"2026-05-19T14:23:18Z"}',
+  'MQTT':      '{"topic":"env/cabin1/h2","payload":{"ppm":12.4,"ts":1716181398}}',
+  'HTTP/API':  '{"camId":"C-031","streamUrl":"rtsp://...","status":"online","bitrate":"2.4Mbps"}',
+  'DB-View':   "SELECT pcs_id, p_act, q_act, soc FROM v_pcs_realtime WHERE station='LFWLW';"
+}
+function openDetail(row) {
+  drawerIface.value = row
+  drawerHistory.value = Array.from({ length: 60 }, () =>
+    Math.max(0, Math.floor(row.framesPerSec * (0.9 + Math.random() * 0.2)))
+  )
+  drawerVisible.value = true
+  nextTick(() => {
+    if (drawerEl.value) {
+      drawerChart?.dispose()
+      drawerChart = echarts.init(drawerEl.value)
+      renderDrawerChart()
+    }
+  })
+}
+function pushDrawerPoint(v) {
+  drawerHistory.value.push(v)
+  if (drawerHistory.value.length > 60) drawerHistory.value.shift()
+  renderDrawerChart()
+}
+function renderDrawerChart() {
+  if (!drawerChart) return
+  drawerChart.setOption({
+    grid: { left: 36, right: 12, top: 16, bottom: 24 },
+    xAxis: { type: 'category', data: drawerHistory.value.map((_, i) => `-${60 - i}s`), axisLabel: { interval: 14, color: '#8a93a8', fontSize: 10 }, axisLine: { lineStyle: { color: '#dadfeb' } } },
+    yAxis: { type: 'value', name: '帧/s', nameTextStyle: { color: '#8a93a8', fontSize: 10 }, splitLine: { lineStyle: { color: '#eef0f7' } }, axisLabel: { color: '#525c75', fontSize: 10 } },
+    series: [{
+      type: 'line', smooth: true, showSymbol: false,
+      data: drawerHistory.value,
+      lineStyle: { color: '#015eea', width: 2 },
+      areaStyle: { color: 'rgba(1,94,234,0.12)' }
+    }]
+  })
+}
+function closeDrawer() {
+  drawerVisible.value = false
+  drawerChart?.dispose(); drawerChart = null
+}
+
+/* ===== 测试连接 ===== */
+const testingId = ref(null)
+async function testConnect(row) {
+  testingId.value = row.id
+  ElMessage.info(`正在测试 ${row.station} / ${row.name} ...`)
+  const start = Date.now()
+  await new Promise(r => setTimeout(r, 900 + Math.random() * 800))
+  const latency = Date.now() - start
+  testingId.value = null
+  if (row.status === 'down') {
+    ElMessage.error(`✗ 连接失败：端点 ${row.port} 无响应（耗时 ${latency}ms）`)
+  } else if (row.status === 'warn') {
+    ElMessage.warning(`⚠ 连接成功但延迟偏高：${latency}ms（阈值 200ms）`)
+  } else {
+    ElMessage.success(`✓ 连接成功，往返延迟 ${latency}ms`)
+  }
+}
+
+function onResize() { flowChart?.resize(); protoChart?.resize(); heatChart?.resize(); drawerChart?.resize() }
+
+/* ===== 事件过滤 ===== */
+const eventTab = ref('all')
+const eventCounts = computed(() => ({
+  all: events.value.length,
+  alert: events.value.filter(e => e.level === 'err' || e.level === 'warn').length,
+  active: events.value.filter(e => e.status === '处置中' || e.status === '观察').length,
+  recovered: events.value.filter(e => e.status === '已恢复').length
+}))
+const filteredEvents = computed(() => {
+  switch (eventTab.value) {
+    case 'alert':     return events.value.filter(e => e.level === 'err' || e.level === 'warn')
+    case 'active':    return events.value.filter(e => e.status === '处置中' || e.status === '观察')
+    case 'recovered': return events.value.filter(e => e.status === '已恢复')
+    default:          return events.value
+  }
+})
 
 onMounted(() => {
   flowChart = echarts.init(flowEl.value)
   protoChart = echarts.init(protoEl.value)
   heatChart = echarts.init(heatEl.value)
   renderFlow(); renderProto(); renderHeat()
+  bindProtoClick(); bindHeatClick()
   window.addEventListener('resize', onResize)
   startTimer()
 })
@@ -267,6 +417,7 @@ onBeforeUnmount(() => {
   stopTimer()
   window.removeEventListener('resize', onResize)
   flowChart?.dispose(); protoChart?.dispose(); heatChart?.dispose()
+  drawerChart?.dispose()
 })
 
 const fmt = (n) => n.toLocaleString()
@@ -280,6 +431,12 @@ const fmt = (n) => n.toLocaleString()
       desc="非侵入接口接入监控 · 协议解析 · 数据点位健康度 · 异常断流告警"
     >
       <template #actions>
+        <el-button
+          :icon="live ? VideoPause : VideoPlay"
+          :type="live ? 'danger' : 'success'"
+          plain
+          @click="toggleLive"
+        >{{ live ? '暂停采集' : '继续采集' }}</el-button>
         <el-button :icon="Refresh" @click="renderFlow(); renderProto(); renderHeat()">刷新</el-button>
         <el-button type="primary" :icon="Download">导出接入清单</el-button>
       </template>
@@ -335,9 +492,9 @@ const fmt = (n) => n.toLocaleString()
       <div class="card">
         <div class="card-head">
           <div class="ch-title">协议流量占比</div>
-          <div class="ch-sub">实时帧/秒</div>
+          <div class="ch-sub">点击切片 · 筛选表格</div>
         </div>
-        <div class="chart" ref="protoEl" />
+        <div class="chart clickable" ref="protoEl" />
       </div>
     </div>
 
@@ -346,9 +503,9 @@ const fmt = (n) => n.toLocaleString()
       <div class="card col-2">
         <div class="card-head">
           <div class="ch-title">站点 × 接口接入健康度</div>
-          <div class="ch-sub">颜色 = 当前数据完整率，标注 ✓ / ⚠ / ✗</div>
+          <div class="ch-sub">点击格子 · 定位到接口</div>
         </div>
-        <div class="chart h280" ref="heatEl" />
+        <div class="chart h280 clickable" ref="heatEl" />
       </div>
       <div class="card">
         <div class="card-head">
@@ -387,9 +544,12 @@ const fmt = (n) => n.toLocaleString()
     </div>
 
     <!-- 行 3: 接口大表 -->
-    <div class="card big">
+    <div class="card big" ref="tableEl">
       <div class="card-head">
-        <div class="ch-title">全量接入接口</div>
+        <div class="ch-title">
+          全量接入接口
+          <span class="ch-tip" v-if="hasFilter">已筛选 {{ filtered.length }} / {{ interfaces.length }} 路</span>
+        </div>
         <div class="filters">
           <el-input v-model="search" placeholder="搜索 站点 / 接口 / 端点" clearable :prefix-icon="Search" size="default" style="width:240px" />
           <el-select v-model="filterStation" placeholder="全部站点" clearable size="default" style="width:160px">
@@ -403,9 +563,17 @@ const fmt = (n) => n.toLocaleString()
             <el-option label="延迟高" value="warn" />
             <el-option label="离线" value="down" />
           </el-select>
+          <el-button v-if="hasFilter" text type="primary" @click="clearFilters">清空筛选</el-button>
         </div>
       </div>
-      <el-table :data="filtered" stripe size="default" max-height="460">
+      <el-table
+        :data="filtered"
+        stripe
+        size="default"
+        max-height="460"
+        :row-class-name="rowClass"
+        :default-sort="{ prop: 'latency', order: 'descending' }"
+      >
         <el-table-column label="状态" width="90">
           <template #default="{ row }">
             <span class="st-pill" :class="row.status">
@@ -426,34 +594,46 @@ const fmt = (n) => n.toLocaleString()
             <code class="endpoint">{{ row.port }}</code>
           </template>
         </el-table-column>
-        <el-table-column prop="tags" label="点位数" width="90" align="right">
+        <el-table-column prop="tags" label="点位数" width="90" align="right" sortable>
           <template #default="{ row }">
             <span class="num">{{ fmt(row.tags) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="实时帧率" width="110" align="right">
+        <el-table-column prop="framesPerSec" label="实时帧率" width="110" align="right" sortable>
           <template #default="{ row }">
             <span class="num">{{ row.framesPerSec }}</span>
             <span class="unit"> 帧/s</span>
           </template>
         </el-table-column>
-        <el-table-column label="延迟" width="100" align="right">
+        <el-table-column prop="latency" label="延迟" width="100" align="right" sortable>
           <template #default="{ row }">
             <span :class="row.latency > 200 ? 'warn' : row.latency > 100 ? 'mid' : 'ok'">{{ Math.round(row.latency) }} ms</span>
           </template>
         </el-table-column>
-        <el-table-column label="丢包率" width="90" align="right">
+        <el-table-column prop="lossRate" label="丢包率" width="90" align="right" sortable>
           <template #default="{ row }">
             <span :class="row.lossRate > 2 ? 'err' : row.lossRate > 0.5 ? 'warn' : 'ok'">{{ row.lossRate.toFixed(2) }}%</span>
           </template>
         </el-table-column>
         <el-table-column prop="last" label="最近更新" width="110" />
-        <el-table-column label="操作" width="120" fixed="right">
-          <template #default>
-            <el-button text type="primary" size="small">详情</el-button>
-            <el-button text type="primary" size="small">测试</el-button>
+        <el-table-column label="操作" width="140" fixed="right">
+          <template #default="{ row }">
+            <el-button text type="primary" size="small" @click="openDetail(row)">详情</el-button>
+            <el-button
+              text
+              type="primary"
+              size="small"
+              :loading="testingId === row.id"
+              @click="testConnect(row)"
+            >测试</el-button>
           </template>
         </el-table-column>
+        <template #empty>
+          <div class="tb-empty">
+            <div>当前筛选无匹配接口</div>
+            <el-button v-if="hasFilter" text type="primary" @click="clearFilters">清空筛选</el-button>
+          </div>
+        </template>
       </el-table>
     </div>
 
@@ -461,10 +641,15 @@ const fmt = (n) => n.toLocaleString()
     <div class="card">
       <div class="card-head">
         <div class="ch-title">最近接入异常事件</div>
-        <el-tag size="small" type="info" effect="light">最近 24 小时</el-tag>
+        <el-radio-group v-model="eventTab" size="small">
+          <el-radio-button value="all">全部 ({{ eventCounts.all }})</el-radio-button>
+          <el-radio-button value="alert">异常 ({{ eventCounts.alert }})</el-radio-button>
+          <el-radio-button value="active">未恢复 ({{ eventCounts.active }})</el-radio-button>
+          <el-radio-button value="recovered">已恢复 ({{ eventCounts.recovered }})</el-radio-button>
+        </el-radio-group>
       </div>
-      <div class="evlist">
-        <div class="ev" v-for="(e, i) in events" :key="i" :class="e.level">
+      <div class="evlist" v-if="filteredEvents.length">
+        <div class="ev" v-for="(e, i) in filteredEvents" :key="i" :class="e.level">
           <div class="ev-dot">
             <el-icon>
               <component :is="e.level === 'err' ? CloseBold : e.level === 'warn' ? Warning : Clock" />
@@ -480,7 +665,74 @@ const fmt = (n) => n.toLocaleString()
           <el-tag size="small" :type="e.status === '已恢复' ? 'success' : e.status === '处置中' ? 'warning' : 'info'">{{ e.status }}</el-tag>
         </div>
       </div>
+      <div class="ev-empty" v-else>当前分组无事件</div>
     </div>
+
+    <!-- 详情抽屉 -->
+    <el-drawer
+      v-model="drawerVisible"
+      :title="drawerIface ? `${drawerIface.station} · ${drawerIface.name}` : '接口详情'"
+      size="520"
+      direction="rtl"
+      @close="closeDrawer"
+    >
+      <div v-if="drawerIface" class="drawer">
+        <div class="d-grid">
+          <div class="d-cell">
+            <div class="d-l">协议</div>
+            <el-tag size="small" :color="PROTOCOLS.find(p => p.key === drawerIface.proto)?.color" effect="dark" style="border:none;color:#fff">{{ drawerIface.proto }}</el-tag>
+          </div>
+          <div class="d-cell">
+            <div class="d-l">状态</div>
+            <span class="st-pill" :class="drawerIface.status">
+              <span class="st-dot" />
+              {{ drawerIface.status === 'ok' ? '正常' : drawerIface.status === 'warn' ? '延迟高' : '离线' }}
+            </span>
+          </div>
+          <div class="d-cell">
+            <div class="d-l">点位数</div>
+            <div class="d-v">{{ fmt(drawerIface.tags) }} 个</div>
+          </div>
+          <div class="d-cell">
+            <div class="d-l">采集频率</div>
+            <div class="d-v">{{ drawerIface.freq }} Hz</div>
+          </div>
+          <div class="d-cell">
+            <div class="d-l">实时帧率</div>
+            <div class="d-v">{{ drawerIface.framesPerSec }} 帧/s</div>
+          </div>
+          <div class="d-cell">
+            <div class="d-l">延迟</div>
+            <div class="d-v" :class="drawerIface.latency > 200 ? 'warn' : drawerIface.latency > 100 ? 'mid' : 'ok'">{{ Math.round(drawerIface.latency) }} ms</div>
+          </div>
+        </div>
+
+        <div class="d-section">
+          <div class="d-section-title">端点地址</div>
+          <code class="endpoint d-endpoint">{{ drawerIface.port }}</code>
+        </div>
+
+        <div class="d-section">
+          <div class="d-section-title">最近 60 秒帧率趋势</div>
+          <div class="d-chart" ref="drawerEl" />
+        </div>
+
+        <div class="d-section">
+          <div class="d-section-title">最近一帧示例 (脱敏)</div>
+          <pre class="d-payload">{{ PAYLOAD_SAMPLES[drawerIface.proto] || '—' }}</pre>
+        </div>
+
+        <div class="d-actions">
+          <el-button
+            type="primary"
+            :icon="Connection"
+            :loading="testingId === drawerIface.id"
+            @click="testConnect(drawerIface)"
+          >测试连接</el-button>
+          <el-button @click="closeDrawer">关闭</el-button>
+        </div>
+      </div>
+    </el-drawer>
   </div>
 </template>
 
@@ -527,6 +779,10 @@ const fmt = (n) => n.toLocaleString()
 .ch-sub { font-size: 12px; color: $text-muted; }
 .chart { width: 100%; height: 280px; }
 .chart.h280 { height: 280px; }
+.chart.clickable { cursor: pointer; }
+.ch-tip { font-size: 11px; color: $brand-blue; font-weight: 500; margin-left: 8px;
+  padding: 2px 8px; background: rgba(1,94,234,0.08); border-radius: 8px;
+}
 
 /* === Tags health === */
 .tags-health { padding: 8px 0; flex: 1; display: flex; flex-direction: column; gap: 16px; }
@@ -559,6 +815,9 @@ const fmt = (n) => n.toLocaleString()
 }
 .st-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .endpoint { background: $bg-soft; padding: 2px 8px; border-radius: 4px; font-size: 11px; color: $brand-blue; font-family: monospace; }
+:deep(.el-table .row-down) { background: rgba(239,68,68,0.05) !important; }
+:deep(.el-table .row-warn) { background: rgba(245,158,11,0.05) !important; }
+.tb-empty { padding: 32px 0; color: $text-muted; display: flex; flex-direction: column; align-items: center; gap: 8px; }
 .num { font-family: $font-num; font-variant-numeric: tabular-nums; font-weight: 500; }
 .unit { font-size: 11px; color: $text-muted; }
 .ok { color: #22d3a0; }
@@ -595,6 +854,25 @@ const fmt = (n) => n.toLocaleString()
 .ev-station { font-weight: 600; color: $text-primary; }
 .ev-iface { color: $text-secondary; }
 .ev-msg { color: $text-secondary; }
+.ev-empty { padding: 32px 0; text-align: center; color: $text-muted; font-size: 13px; }
+
+/* === Drawer === */
+.drawer { padding: 0 4px; display: flex; flex-direction: column; gap: 20px; }
+.d-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 18px; }
+.d-cell { display: flex; flex-direction: column; gap: 4px; }
+.d-l { font-size: 11px; color: $text-muted; }
+.d-v { font-family: $font-num; font-weight: 600; font-size: 15px; color: $text-primary;
+  &.ok { color: #22d3a0; } &.mid { color: #015eea; } &.warn { color: #f59e0b; }
+}
+.d-section-title { font-size: 12px; color: $text-muted; margin-bottom: 6px; font-weight: 500; }
+.d-endpoint { font-size: 12px; padding: 6px 10px; display: block; word-break: break-all; }
+.d-chart { width: 100%; height: 160px; background: $bg-soft; border-radius: 6px; }
+.d-payload {
+  background: #10152e; color: #b3c5ff; padding: 12px 14px; border-radius: 6px;
+  font-family: 'JetBrains Mono', Menlo, monospace; font-size: 11px; line-height: 1.55;
+  overflow-x: auto; margin: 0;
+}
+.d-actions { display: flex; gap: 8px; margin-top: 4px; }
 
 @media (max-width: 1400px) {
   .kpi-row { grid-template-columns: repeat(3, 1fr); }
