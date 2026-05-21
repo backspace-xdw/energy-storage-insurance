@@ -2,7 +2,8 @@
 import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import echarts from '@/utils/echarts'
 import dayjs from 'dayjs'
-import { DataLine, Histogram, List, Refresh, Document, View } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import { DataLine, Histogram, List, Refresh, Document, View, Grid } from '@element-plus/icons-vue'
 
 const props = defineProps({
   detail: { type: Object, required: true }
@@ -10,6 +11,88 @@ const props = defineProps({
 
 const activeTab = ref('realtime')
 const histRange = ref('24h')
+
+/* ---------- PACK 列表（station/cabin/cluster 才有） ---------- */
+const packList = computed(() => {
+  const n = props.detail.node
+  if (!n) return []
+  const out = []
+  function walk(node, path) {
+    if (node.type === 'pack') {
+      out.push({
+        id: node.id,
+        path,
+        label: node.label,
+        ...node.info,
+        tempDelta: +(node.info.temperatureMax - node.info.temperatureMin).toFixed(1),
+        voltDelta: Math.round((node.info.cellVoltageMax - node.info.cellVoltageMin) * 1000)
+      })
+      return
+    }
+    node.children?.forEach(c => walk(c, path ? path + ' / ' + node.label : node.label))
+  }
+  walk(n, '')
+  return out
+})
+const hasPackList = computed(() => packList.value.length > 0 && props.detail.type !== 'pack')
+
+function packHealth(p) {
+  if (p.soh < 90 || p.temperatureMax > 38) return 'err'
+  if (p.soh < 93 || p.temperatureMax > 35 || p.voltDelta > 50) return 'warn'
+  return 'ok'
+}
+function rowClass({ row }) {
+  return 'row-' + packHealth(row)
+}
+
+const packSearch = ref('')
+const packFilter = ref('')
+const filteredPacks = computed(() =>
+  packList.value.filter(p =>
+    (!packSearch.value || p.label.includes(packSearch.value) || p.path.includes(packSearch.value)) &&
+    (!packFilter.value || packHealth(p) === packFilter.value)
+  )
+)
+
+function exportPacks() {
+  const rows = filteredPacks.value
+  if (!rows.length) { ElMessage.warning('无可导出数据'); return }
+  const fields = ['id', 'path', 'label', 'voltage', 'current', 'soc', 'soh', 'temperatureMax', 'temperatureMin', 'tempDelta', 'cellVoltageMax', 'cellVoltageMin', 'voltDelta', 'insulation', 'faultCode']
+  const header = ['编号', '层级路径', '标签', 'PACK电压V', '电流A', 'SOC%', 'SOH%', '最高温℃', '最低温℃', '温差℃', '电芯最高V', '电芯最低V', '压差mV', '绝缘kΩ', '故障码']
+  const csv = [header.join(',')]
+  rows.forEach(r => {
+    csv.push(fields.map(f => {
+      const v = r[f]
+      const s = v === undefined || v === null ? '' : String(v).replace(/"/g, '""')
+      return /[,"\n]/.test(s) ? `"${s}"` : s
+    }).join(','))
+  })
+  const blob = new Blob(['﻿' + csv.join('\n')], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${props.detail.label}-PACK清单-${dayjs().format('YYYY-MM-DD')}.csv`
+  a.click()
+  URL.revokeObjectURL(url)
+  ElMessage.success(`已导出 ${rows.length} 条 PACK 数据`)
+}
+
+function exportTrendCSV() {
+  const { labels, series } = genSeries(histRange.value, props.detail.type)
+  const header = ['时间', ...series.map(s => s.name)]
+  const csv = [header.join(',')]
+  labels.forEach((t, i) => {
+    csv.push([t, ...series.map(s => s.data[i])].join(','))
+  })
+  const blob = new Blob(['﻿' + csv.join('\n')], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${props.detail.label}-${histRange.value}-${dayjs().format('YYYY-MM-DD-HHmm')}.csv`
+  a.click()
+  URL.revokeObjectURL(url)
+  ElMessage.success(`已导出 ${labels.length} 行历史数据`)
+}
 
 /* ---------- 详情字段映射 ---------- */
 const typeLabel = (t) => ({ station: '站点', cabin: '舱级', cluster: '簇级', pack: 'PACK 级' }[t] || '设备')
@@ -324,13 +407,13 @@ onBeforeUnmount(() => {
         <div class="tp">
           <div class="trend-head">
             <el-radio-group v-model="histRange" size="small">
-              <el-radio-button label="24h">近 24 小时</el-radio-button>
-              <el-radio-button label="7d">近 7 天</el-radio-button>
-              <el-radio-button label="30d">近 30 天</el-radio-button>
+              <el-radio-button value="24h">近 24 小时</el-radio-button>
+              <el-radio-button value="7d">近 7 天</el-radio-button>
+              <el-radio-button value="30d">近 30 天</el-radio-button>
             </el-radio-group>
             <div class="th-right">
               <el-button size="small" :icon="Refresh" @click="renderTrend">刷新</el-button>
-              <el-button size="small" :icon="Document">导出 CSV</el-button>
+              <el-button size="small" :icon="Document" @click="exportTrendCSV">导出 CSV</el-button>
             </div>
           </div>
           <div class="trend-chart" ref="trendEl" />
@@ -375,6 +458,68 @@ onBeforeUnmount(() => {
             <span><i style="background:#06b6d4" />偏高</span>
             <span><i style="background:#22d3a0" />均值参考线</span>
           </div>
+        </div>
+      </el-tab-pane>
+
+      <el-tab-pane name="packs" v-if="hasPackList">
+        <template #label>
+          <span class="t-l"><el-icon><Grid /></el-icon> PACK 清单 ({{ packList.length }})</span>
+        </template>
+        <div class="tp">
+          <div class="pl-head">
+            <el-input v-model="packSearch" placeholder="搜索 PACK 编号/层级" clearable size="default" style="width:240px" />
+            <el-radio-group v-model="packFilter" size="small">
+              <el-radio-button value="">全部</el-radio-button>
+              <el-radio-button value="ok">正常</el-radio-button>
+              <el-radio-button value="warn">警示</el-radio-button>
+              <el-radio-button value="err">异常</el-radio-button>
+            </el-radio-group>
+            <div class="pl-spacer" />
+            <el-button size="default" :icon="Document" @click="exportPacks">导出 CSV ({{ filteredPacks.length }})</el-button>
+          </div>
+          <el-table
+            :data="filteredPacks"
+            stripe
+            size="default"
+            max-height="520"
+            :row-class-name="rowClass"
+            :default-sort="{ prop: 'temperatureMax', order: 'descending' }"
+          >
+            <el-table-column label="健康度" width="80">
+              <template #default="{ row }">
+                <span class="pl-pill" :class="packHealth(row)">
+                  <span class="pl-dot" />
+                  {{ packHealth(row) === 'err' ? '异常' : packHealth(row) === 'warn' ? '警示' : '正常' }}
+                </span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="path" label="层级路径" min-width="200" show-overflow-tooltip />
+            <el-table-column prop="label" label="PACK" width="110" sortable />
+            <el-table-column prop="voltage" label="电压(V)" width="100" align="right" sortable />
+            <el-table-column prop="current" label="电流(A)" width="100" align="right" sortable>
+              <template #default="{ row }">
+                <span :class="row.current < 0 ? 'neg' : ''">{{ row.current }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="soc" label="SOC(%)" width="90" align="right" sortable />
+            <el-table-column prop="soh" label="SOH(%)" width="90" align="right" sortable>
+              <template #default="{ row }">
+                <span :class="row.soh < 90 ? 'err' : row.soh < 93 ? 'warn' : ''">{{ row.soh }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="temperatureMax" label="最高温℃" width="100" align="right" sortable>
+              <template #default="{ row }">
+                <span :class="row.temperatureMax > 38 ? 'err' : row.temperatureMax > 35 ? 'warn' : ''">{{ row.temperatureMax }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="tempDelta" label="温差℃" width="90" align="right" sortable />
+            <el-table-column prop="voltDelta" label="压差mV" width="100" align="right" sortable>
+              <template #default="{ row }">
+                <span :class="row.voltDelta > 80 ? 'err' : row.voltDelta > 50 ? 'warn' : ''">{{ row.voltDelta }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column prop="insulation" label="绝缘kΩ" width="100" align="right" sortable />
+          </el-table>
         </div>
       </el-tab-pane>
 
@@ -500,7 +645,25 @@ onBeforeUnmount(() => {
 .ev-time { font-size: 11px; color: $text-muted; margin-top: 6px; font-family: $font-num; }
 .ev-empty { padding: 40px; text-align: center; color: $text-muted; }
 
+/* === PACK 清单 === */
+.pl-head { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; }
+.pl-spacer { flex: 1; }
+.pl-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500;
+  &.ok { background: rgba(34,211,160,0.12); color: #16a085; }
+  &.warn { background: rgba(245,158,11,0.14); color: #d97706; }
+  &.err { background: rgba(239,68,68,0.12); color: #ef4444; }
+}
+.pl-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+:deep(.el-table .row-warn) { background: rgba(245,158,11,0.04) !important; }
+:deep(.el-table .row-err)  { background: rgba(239,68,68,0.05) !important; }
+.neg { color: #06b6d4; }
+.warn { color: #f59e0b; }
+.err { color: #ef4444; }
+
 @media (max-width: 1100px) {
   .trend-summary, .dist-kpis { grid-template-columns: repeat(2, 1fr); }
+  .pl-head { flex-wrap: wrap; }
 }
 </style>

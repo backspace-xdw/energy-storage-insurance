@@ -1,13 +1,17 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import PageHeader from '@/components/PageHeader.vue'
 import DeviceTabs from './DeviceTabs.vue'
 import { stations, buildStationTree } from '@/mock/data'
-import { Download, Document, Filter } from '@element-plus/icons-vue'
+import { Download, Document, Filter, View, Lock } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 
+const router = useRouter()
 const currentStationId = ref(stations[0].id)
 const tree = ref(null)
 const selectedNode = ref(null)
+const treeRef = ref(null)
 
 function loadTree(id) {
   tree.value = buildStationTree(id)
@@ -19,12 +23,48 @@ onMounted(() => loadTree(currentStationId.value))
 function onSelect(data) { selectedNode.value = data }
 
 const filterText = ref('')
-const filterTree = ref(null)
 
 const treeProps = { children: 'children', label: 'label' }
 const filterNode = (value, data) => {
   if (!value) return true
-  return data.label.toLowerCase().includes(value.toLowerCase())
+  const v = value.toLowerCase()
+  return data.label.toLowerCase().includes(v) || (data.id && String(data.id).toLowerCase().includes(v))
+}
+watch(filterText, (v) => { treeRef.value?.filter(v) })
+
+/* ---------- PACK 状态着色（基于温度/SOH） ---------- */
+function packStatus(info) {
+  if (!info) return null
+  if (info.temperatureMax > 35 || info.soh < 93) return 'warn'
+  if (info.temperatureMax > 38 || info.soh < 90) return 'err'
+  return 'ok'
+}
+function aggStatus(node) {
+  // 子树聚合：err > warn > ok
+  if (!node?.children) return null
+  let worst = null
+  function walk(n) {
+    if (n.type === 'pack') {
+      const s = packStatus(n.info)
+      if (s === 'err') worst = 'err'
+      else if (s === 'warn' && worst !== 'err') worst = 'warn'
+      else if (s === 'ok' && !worst) worst = 'ok'
+    }
+    n.children?.forEach(walk)
+  }
+  walk(node)
+  return worst
+}
+function nodeStatusInfo(data) {
+  if (data.type === 'pack') {
+    const s = packStatus(data.info)
+    return s ? { status: s, label: s === 'err' ? '异常' : s === 'warn' ? '警示' : '正常' } : null
+  }
+  if (data.type === 'cabin' || data.type === 'cluster') {
+    const s = aggStatus(data)
+    return s && s !== 'ok' ? { status: s, label: s === 'err' ? '含异常' : '含警示' } : null
+  }
+  return null
 }
 
 function nodeIconColor(type) {
@@ -38,8 +78,46 @@ function nodeIconLetter(type) {
 const detail = computed(() => {
   const n = selectedNode.value
   if (!n) return null
-  return { type: n.type, label: n.label, info: n.info }
+  return { type: n.type, label: n.label, info: n.info, node: n }
 })
+
+/* ---------- 详情头操作按钮 ---------- */
+function gotoRealtime() {
+  ElMessage.success('正在跳转实时监控')
+  router.push('/app/realtime')
+}
+function gotoEvidence() {
+  ElMessage.success('正在打开承保证据')
+  router.push('/app/evidence')
+}
+
+/* ---------- 顶部操作 ---------- */
+function exportLedger() {
+  const flat = []
+  function walk(n, path) {
+    flat.push({ path: path + n.label, type: n.type, id: n.id, ...(n.info || {}) })
+    n.children?.forEach(c => walk(c, path + n.label + ' / '))
+  }
+  if (tree.value) walk(tree.value, '')
+  const fields = Array.from(new Set(flat.flatMap(r => Object.keys(r))))
+  const csv = [fields.join(',')]
+  flat.forEach(r => {
+    csv.push(fields.map(f => {
+      const v = r[f]
+      if (v === undefined || v === null) return ''
+      const s = String(v).replace(/"/g, '""')
+      return /[,"\n]/.test(s) ? `"${s}"` : s
+    }).join(','))
+  })
+  const blob = new Blob(['﻿' + csv.join('\n')], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${tree.value?.label || 'station'}-台账-${new Date().toISOString().slice(0, 10)}.csv`
+  a.click()
+  URL.revokeObjectURL(url)
+  ElMessage.success(`已导出 ${flat.length} 条台账数据`)
+}
 </script>
 
 <template>
@@ -50,8 +128,7 @@ const detail = computed(() => {
       desc="站-舱-簇-PACK 四级数字档案 · 自动构建 · 一键导出"
     >
       <template #actions>
-        <el-button :icon="Filter">高级筛选</el-button>
-        <el-button :icon="Document">导出台账清单</el-button>
+        <el-button :icon="Document" @click="exportLedger">导出台账清单</el-button>
         <el-button type="primary" :icon="Download">生成初始状态评估报告</el-button>
       </template>
     </PageHeader>
@@ -92,12 +169,12 @@ const detail = computed(() => {
           </div>
           <el-tree
             v-if="tree"
-            ref="filterTree"
+            ref="treeRef"
             :data="[tree]"
             :props="treeProps"
             node-key="id"
             highlight-current
-            default-expand-all
+            :default-expanded-keys="[tree.id, ...tree.children.map(c => c.id)]"
             :filter-node-method="filterNode"
             @node-click="onSelect"
             class="device-tree"
@@ -108,6 +185,12 @@ const detail = computed(() => {
                   {{ nodeIconLetter(data.type) }}
                 </div>
                 <span class="tn-label">{{ node.label }}</span>
+                <span
+                  v-if="nodeStatusInfo(data)"
+                  class="tn-dot"
+                  :class="nodeStatusInfo(data).status"
+                  :title="nodeStatusInfo(data).label"
+                />
               </div>
             </template>
           </el-tree>
@@ -126,8 +209,8 @@ const detail = computed(() => {
               <span class="dt-id">ID: {{ detail.info?.id || selectedNode?.id || '—' }}</span>
             </div>
             <div class="dt-actions">
-              <el-button :icon="Filter">实时监控</el-button>
-              <el-button type="primary" :icon="Document">查看承保证据</el-button>
+              <el-button :icon="View" @click="gotoRealtime">实时监控</el-button>
+              <el-button type="primary" :icon="Lock" @click="gotoEvidence">查看承保证据</el-button>
             </div>
           </div>
           <DeviceTabs :detail="detail" :key="detail.label" />
@@ -167,13 +250,29 @@ const detail = computed(() => {
 .si-sub { font-size: 11px; color: $text-muted; margin-top: 2px; }
 
 .device-tree { font-size: 13px; max-height: 50vh; overflow: auto; }
-.tree-node { display: flex; align-items: center; gap: 8px; }
+.tree-node { display: flex; align-items: center; gap: 8px; width: 100%; }
 .tn-icon {
   width: 22px; height: 22px; border-radius: 6px; color: #fff;
   font-size: 11px; display: flex; align-items: center; justify-content: center;
   font-weight: 600; flex-shrink: 0;
 }
-.tn-label { font-size: 13px; }
+.tn-label { font-size: 13px; flex: 1; min-width: 0; }
+.tn-dot {
+  width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; flex-shrink: 0;
+  &.ok   { background: #22d3a0; }
+  &.warn { background: #f59e0b; box-shadow: 0 0 0 0 rgba(245,158,11,0.5); animation: pulse-warn 1.8s infinite; }
+  &.err  { background: #ef4444; box-shadow: 0 0 0 0 rgba(239,68,68,0.5); animation: pulse-err 1.4s infinite; }
+}
+@keyframes pulse-warn {
+  0%   { box-shadow: 0 0 0 0 rgba(245,158,11,0.5); }
+  70%  { box-shadow: 0 0 0 5px rgba(245,158,11,0); }
+  100% { box-shadow: 0 0 0 0 rgba(245,158,11,0); }
+}
+@keyframes pulse-err {
+  0%   { box-shadow: 0 0 0 0 rgba(239,68,68,0.55); }
+  70%  { box-shadow: 0 0 0 6px rgba(239,68,68,0); }
+  100% { box-shadow: 0 0 0 0 rgba(239,68,68,0); }
+}
 
 .right { min-width: 0; }
 .detail { padding: 18px 22px; }
