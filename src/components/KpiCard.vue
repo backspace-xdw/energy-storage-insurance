@@ -1,4 +1,6 @@
 <script setup>
+import { CaretTop, CaretBottom } from '@element-plus/icons-vue'
+
 defineProps({
   label: String,
   value: [String, Number],
@@ -34,26 +36,26 @@ defineProps({
 @use '@/styles/variables.scss' as *;
 
 .kpi {
-  display: flex; gap: 16px; align-items: center;
+  display: flex; gap: 12px; align-items: center;
   background: $bg-card;
   border: 1px solid $border-soft;
   border-radius: $radius;
-  padding: 20px 22px;
+  padding: 14px 16px;
   transition: transform 0.2s, box-shadow 0.2s;
   position: relative; overflow: hidden;
   &::before {
     content: '';
     position: absolute; right: -30px; top: -30px;
-    width: 120px; height: 120px; border-radius: 50%;
+    width: 110px; height: 110px; border-radius: 50%;
     background: rgba(1, 94, 234, 0.06);
   }
   &:hover { transform: translateY(-3px); box-shadow: $shadow-card-hover; }
 }
 .kpi-icon {
-  width: 48px; height: 48px; border-radius: 12px;
+  width: 42px; height: 42px; border-radius: 10px;
   background: $grad-cyan; color: #fff;
   display: flex; align-items: center; justify-content: center;
-  font-size: 22px; flex-shrink: 0;
+  font-size: 20px; flex-shrink: 0;
   position: relative; z-index: 1;
 }
 .kpi-blue .kpi-icon { background: linear-gradient(135deg, #015eea, #1e2188); }
@@ -63,14 +65,14 @@ defineProps({
 .kpi-violet .kpi-icon { background: linear-gradient(135deg, #6366f1, #8b5cf6); }
 
 .kpi-body { flex: 1; min-width: 0; }
-.kpi-label { font-size: 13px; color: $text-muted; }
-.kpi-value { display: flex; align-items: baseline; gap: 4px; margin-top: 4px; }
-.kpi-value .num { font-size: 28px; font-weight: 600; color: $text-primary; font-family: $font-num;
-  font-variant-numeric: tabular-nums lining-nums; letter-spacing: 0.5px; }
+.kpi-label { font-size: 14px; color: $text-muted; line-height: 1.2; }
+.kpi-value { display: flex; align-items: baseline; gap: 4px; margin-top: 2px; }
+.kpi-value .num { font-size: 36px; font-weight: 600; color: $text-primary; font-family: $font-num;
+  font-variant-numeric: tabular-nums lining-nums; letter-spacing: 0.5px; line-height: 1.1; }
 .kpi-value .unit { font-size: 13px; color: $text-muted; }
 .kpi-delta {
   display: inline-flex; align-items: center; gap: 4px;
-  font-size: 12px; margin-top: 6px;
+  font-size: 12px; margin-top: 2px; line-height: 1.2;
   &.up { color: #22d3a0; }
   &.down { color: #ef4444; }
   &.flat { color: $text-muted; }

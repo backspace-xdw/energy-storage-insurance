@@ -4,7 +4,8 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   Odometer, Box, Lock, DataAnalysis, Refresh, Warning, Bell, Setting,
   Bell as BellIcon, ArrowDown, HomeFilled, SwitchButton, UserFilled,
-  VideoCamera, Connection, Lightning, VideoPlay, MagicStick
+  VideoCamera, Connection, Lightning, VideoPlay, MagicStick,
+  Search, Expand, Fold
 } from '@element-plus/icons-vue'
 import { useAuthStore } from '@/stores/auth'
 import { ElMessageBox, ElMessage } from 'element-plus'
@@ -94,7 +95,7 @@ async function handleLogout() {
             text
             class="collapse-btn"
             @click="collapsed = !collapsed"
-            :icon="collapsed ? 'Expand' : 'Fold'"
+            :icon="collapsed ? Expand : Fold"
           />
           <el-breadcrumb separator="/">
             <el-breadcrumb-item :to="{ path: '/app/dashboard' }">
@@ -109,7 +110,7 @@ async function handleLogout() {
             placeholder="搜索站点 / 设备 / 报告"
             class="search"
             clearable
-            :prefix-icon="'Search'"
+            :prefix-icon="Search"
           />
           <el-badge :value="6" class="badge">
             <el-button text :icon="BellIcon" />
@@ -259,11 +260,13 @@ async function handleLogout() {
   top: 0;
   z-index: 10;
 }
-.topbar-left { display: flex; align-items: center; gap: 16px; }
+.topbar-left { display: flex; align-items: center; gap: 16px; flex-shrink: 0; white-space: nowrap; }
+.topbar-left :deep(.el-breadcrumb) { white-space: nowrap; }
+.topbar-left :deep(.el-breadcrumb__inner) { white-space: nowrap; }
 .collapse-btn { font-size: 18px; }
-.topbar-right { display: flex; align-items: center; gap: 16px; }
+.topbar-right { display: flex; align-items: center; gap: 16px; min-width: 0; flex: 1; justify-content: flex-end; }
+.search { min-width: 0; flex: 0 1 280px; }
 .search :deep(.el-input__wrapper) {
-  width: 280px;
   border-radius: 20px;
   background: $bg-soft;
   box-shadow: none;

@@ -1,12 +1,12 @@
 <script setup>
-import { ref, reactive, computed, onMounted, onBeforeUnmount, watch } from 'vue'
-import * as echarts from 'echarts'
+import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
+import echarts from '@/utils/echarts'
 import dayjs from 'dayjs'
 import PageHeader from '@/components/PageHeader.vue'
 import { stations } from '@/mock/data'
 import {
   VideoPlay, VideoPause, ArrowLeftBold, ArrowRightBold, Refresh,
-  Download, Clock, Warning, MagicStick
+  Download, Clock, Warning, MagicStick, Aim
 } from '@element-plus/icons-vue'
 
 /* ---------- 选择 ---------- */
@@ -28,7 +28,6 @@ function genHistory() {
   const incidentOffset = incidentAt.diff(start, 'second')
   return Array.from({ length: total }, (_, i) => {
     const t = start.add(i, 'second')
-    // 距事故点的距离（秒），用于构造热失控峰
     const d = i - incidentOffset
     let temp, ins, vDelta
     if (d < -300) {
@@ -36,19 +35,16 @@ function genHistory() {
       ins = 4800 + (Math.random() - 0.5) * 100
       vDelta = 22 + (Math.random() - 0.5) * 6
     } else if (d < 0) {
-      // 事故前 5 分钟：缓慢爬升
       const k = (d + 300) / 300
       temp = 28 + k * k * 12 + (Math.random() - 0.5) * 0.6
       ins = 4800 - k * k * 3500
       vDelta = 22 + k * k * 28
     } else if (d < 120) {
-      // 事故后 2 分钟：峰值
       const k = Math.exp(-d / 30)
       temp = 28 + 36 * k + (Math.random() - 0.5) * 0.8
       ins = 60 + (1 - k) * 4700
       vDelta = 50 + 40 * k
     } else {
-      // 恢复
       temp = 28 + Math.sin(i / 40) * 1.5 + (Math.random() - 0.5) * 0.4
       ins = 4800 + (Math.random() - 0.5) * 100
       vDelta = 22 + (Math.random() - 0.5) * 6
@@ -63,6 +59,7 @@ function genHistory() {
       current: +I.toFixed(1),
       tempMax: +temp.toFixed(1),
       tempMin: +(temp - 2 - Math.random()).toFixed(1),
+      tempDelta: +(temp - (temp - 2 - Math.random())).toFixed(1),
       soc: +SOC.toFixed(1),
       insulation: Math.max(20, Math.round(ins)),
       voltageDelta: Math.max(8, Math.round(vDelta))
@@ -83,7 +80,6 @@ const incidents = computed(() => {
     { offset: 24 * 60 + 2,  label: '运维远程拉闸',           level: 'info' },
     { offset: 31 * 60 + 10, label: '温度回落、绝缘恢复',     level: 'ok'   }
   ]
-  // 转成绝对时间戳的偏移（从 13:50 → 14:31，相对窗口起点）
   const baseTime = dayjs('2026-03-12 14:00')
   return events.map(e => {
     const t = baseTime.add(e.offset, 'second')
@@ -92,10 +88,16 @@ const incidents = computed(() => {
   }).filter(e => e.idx >= 0 && e.idx < totalSec.value)
 })
 
+/* 事故关键时刻 = 第一条 err 级 */
+const incidentIdx = computed(() => {
+  const err = incidents.value.find(e => e.level === 'err')
+  return err ? err.idx : Math.floor(totalSec.value / 2)
+})
+
 /* ---------- 播放控制 ---------- */
-const cursor = ref(0)        // 当前游标 (秒)
+const cursor = ref(0)
 const playing = ref(false)
-const speed = ref(5)         // 倍速 1/2/5/10/30
+const speed = ref(5)
 const speeds = [1, 2, 5, 10, 30]
 
 let timer = null
@@ -116,24 +118,113 @@ function rewind(s) { cursor.value = Math.max(0, cursor.value - s) }
 function forward(s) { cursor.value = Math.min(totalSec.value - 1, cursor.value + s) }
 function jumpTo(idx) { cursor.value = idx; pause() }
 
+/* 快速跳转 */
+function jumpBefore5min() { jumpTo(Math.max(0, incidentIdx.value - 300)) }
+function jumpAtIncident() { jumpTo(incidentIdx.value) }
+function jumpAfter2min() { jumpTo(Math.min(totalSec.value - 1, incidentIdx.value + 120)) }
+
+/* 倍速档位调节 */
+function speedUp() {
+  const i = speeds.indexOf(speed.value)
+  if (i < speeds.length - 1) speed.value = speeds[i + 1]
+}
+function speedDown() {
+  const i = speeds.indexOf(speed.value)
+  if (i > 0) speed.value = speeds[i - 1]
+}
+
 watch(speed, () => { if (playing.value) play() })
 watch(range, () => { history.value = genHistory(); cursor.value = 0; pause(); renderAll() })
+
+/* ---------- 键盘快捷键 ---------- */
+function onKey(e) {
+  if (e.target?.matches?.('input, textarea, [contenteditable]')) return
+  if (e.metaKey || e.ctrlKey || e.altKey) return
+  if (e.code === 'Space') { e.preventDefault(); toggle() }
+  else if (e.code === 'ArrowLeft') { e.preventDefault(); rewind(10) }
+  else if (e.code === 'ArrowRight') { e.preventDefault(); forward(10) }
+  else if (e.key === '+' || e.key === '=') { e.preventDefault(); speedUp() }
+  else if (e.key === '-' || e.key === '_') { e.preventDefault(); speedDown() }
+}
 
 /* ---------- 当前帧 ---------- */
 const cur = computed(() => history.value[cursor.value] || history.value[0])
 const cursorPct = computed(() => (cursor.value / (totalSec.value - 1)) * 100)
 const curTime = computed(() => cur.value.time)
 
+/* ---------- sparkline ±30s ---------- */
+const SPARK_R = 30
+const SPARK_W = 64
+const SPARK_H = 18
+
+function sparkWindow() {
+  const c = cursor.value
+  const lo = Math.max(0, c - SPARK_R)
+  const hi = Math.min(history.value.length - 1, c + SPARK_R)
+  return { lo, hi, c }
+}
+
+// 为避免重复扫描，把 (lo,hi,min,max) 一并算好
+const sparkCache = computed(() => {
+  const { lo, hi, c } = sparkWindow()
+  const len = hi - lo + 1
+  const out = {}
+  const fields = ['voltage', 'current', 'tempMax', 'tempDelta', 'voltageDelta', 'insulation', 'soc']
+  fields.forEach(f => {
+    let mn = Infinity, mx = -Infinity
+    for (let i = lo; i <= hi; i++) {
+      const v = history.value[i][f]
+      if (v < mn) mn = v
+      if (v > mx) mx = v
+    }
+    out[f] = { mn, mx, lo, hi, len, c }
+  })
+  return out
+})
+
+function sparkPath(field) {
+  const meta = sparkCache.value[field]
+  if (!meta) return ''
+  const { mn, mx, lo, hi, len } = meta
+  const span = mx - mn || 1
+  const step = SPARK_W / Math.max(1, len - 1)
+  let s = ''
+  for (let i = lo; i <= hi; i++) {
+    const v = (field === 'tempDelta')
+      ? +(history.value[i].tempMax - history.value[i].tempMin).toFixed(2)
+      : history.value[i][field]
+    const x = ((i - lo) * step).toFixed(1)
+    const y = (SPARK_H - 1 - ((v - mn) / span) * (SPARK_H - 2)).toFixed(1)
+    s += (i === lo ? 'M' : 'L') + x + ',' + y + ' '
+  }
+  return s
+}
+function sparkAreaPath(field) {
+  const meta = sparkCache.value[field]
+  if (!meta) return ''
+  return sparkPath(field) + ` L${SPARK_W},${SPARK_H} L0,${SPARK_H} Z`
+}
+function sparkDot(field) {
+  const meta = sparkCache.value[field]
+  if (!meta) return { x: 0, y: 0 }
+  const { mn, mx, lo, hi, c } = meta
+  const span = mx - mn || 1
+  const step = SPARK_W / Math.max(1, (hi - lo))
+  const v = (field === 'tempDelta')
+    ? +(history.value[c].tempMax - history.value[c].tempMin).toFixed(2)
+    : history.value[c][field]
+  return {
+    x: +((c - lo) * step).toFixed(1),
+    y: +(SPARK_H - 1 - ((v - mn) / span) * (SPARK_H - 2)).toFixed(1)
+  }
+}
+
 /* ---------- 单体电压（随事故时刻变化） ---------- */
 const cellsAt = computed(() => {
   const c = cur.value
-  // 事故附近某些电芯异常偏低
   return Array.from({ length: 104 }, (_, i) => {
     let v = 3.35 + (Math.random() - 0.5) * 0.02
-    if (i === 6 && c.voltageDelta > 50) {
-      // PACK-07 异常电芯
-      v -= c.voltageDelta / 1000
-    }
+    if (i === 6 && c.voltageDelta > 50) v -= c.voltageDelta / 1000
     return v
   })
 })
@@ -143,7 +234,7 @@ const tempGridAt = computed(() => {
   const c = cur.value
   return Array.from({ length: 16 }, (_, i) => {
     let base = c.tempMin + (c.tempMax - c.tempMin) * Math.random()
-    if (i === 6 && c.tempMax > 40) base = c.tempMax - 1 + Math.random() * 2 // 中心区域热点
+    if (i === 6 && c.tempMax > 40) base = c.tempMax - 1 + Math.random() * 2
     return +base.toFixed(1)
   })
 })
@@ -154,55 +245,90 @@ const cellEl = ref(null)
 const heatEl = ref(null)
 let trendChart, cellChart, heatChart
 
+function cursorMarkLine() {
+  return {
+    symbol: ['none', 'circle'],
+    symbolSize: 8,
+    animation: false,
+    silent: true,
+    data: [{
+      xAxis: cursor.value,
+      lineStyle: { color: '#06b6d4', width: 2, type: 'solid', shadowColor: 'rgba(6,182,212,0.4)', shadowBlur: 4 },
+      label: { show: false }
+    }]
+  }
+}
+function incidentMarkPoint() {
+  return {
+    symbol: 'pin', symbolSize: 28,
+    animation: false,
+    label: { show: false },
+    data: incidents.value.map(e => ({
+      xAxis: e.idx, yAxis: history.value[e.idx]?.tempMax || 30,
+      itemStyle: { color: e.level === 'err' ? '#ef4444' : e.level === 'warn' ? '#f59e0b' : e.level === 'ok' ? '#22d3a0' : '#015eea' },
+      name: e.label
+    }))
+  }
+}
+
 function renderTrend() {
   if (!trendChart) return
   const labels = history.value.map(d => d.time)
+  const axisFont = { color: '#525c75', fontSize: 12, fontFamily: 'inherit' }
+  const nameFont = { color: '#8a93a8', fontSize: 12, fontWeight: 500 }
   trendChart.setOption({
-    tooltip: { trigger: 'axis' },
-    legend: { top: 0, right: 0, textStyle: { fontSize: 11 } },
-    grid: { left: 50, right: 60, top: 36, bottom: 30 },
+    textStyle: { fontFamily: 'PingFang SC, -apple-system, "Segoe UI", system-ui, sans-serif' },
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: 'rgba(16,21,46,0.92)',
+      borderColor: 'transparent',
+      textStyle: { color: '#fff', fontSize: 12 }
+    },
+    legend: {
+      top: 6, left: 'center',
+      itemWidth: 14, itemHeight: 8, itemGap: 18,
+      data: ['PACK 电压', '最高温(℃)', '电流(A)', 'SOC(%)'],
+      textStyle: { fontSize: 13, color: '#1a1f36', fontWeight: 500 }
+    },
+    grid: { left: 56, right: 64, top: 56, bottom: 36 },
     xAxis: {
       type: 'category', data: labels,
-      axisLabel: { color: '#525c75', fontSize: 11, interval: Math.floor(labels.length / 8) },
-      axisLine: { lineStyle: { color: '#dadfeb' } }
+      axisLabel: { ...axisFont, interval: Math.floor(labels.length / 8), margin: 10 },
+      axisLine: { lineStyle: { color: '#dadfeb' } },
+      axisTick: { show: false }
     },
     yAxis: [
       { type: 'value', name: '电压 V / 温度 ℃', position: 'left',
         splitLine: { lineStyle: { color: '#eef0f7' } },
-        axisLabel: { color: '#525c75', fontSize: 11 },
-        nameTextStyle: { color: '#8a93a8', fontSize: 11 }
+        axisLabel: axisFont,
+        nameTextStyle: { ...nameFont, align: 'left', padding: [0, 0, 0, -40] },
+        nameGap: 12
       },
       { type: 'value', name: '电流 A / SOC %', position: 'right',
         splitLine: { show: false },
-        axisLabel: { color: '#525c75', fontSize: 11 },
-        nameTextStyle: { color: '#8a93a8', fontSize: 11 }
+        axisLabel: axisFont,
+        nameTextStyle: { ...nameFont, align: 'right', padding: [0, -40, 0, 0] },
+        nameGap: 12
       }
     ],
     series: [
-      { name: 'PACK 电压', type: 'line', smooth: true, showSymbol: false, data: history.value.map(d => d.voltage), lineStyle: { color: '#015eea', width: 2 }, areaStyle: { color: 'rgba(1,94,234,0.1)' } },
-      { name: '最高温(℃)', type: 'line', smooth: true, showSymbol: false, data: history.value.map(d => d.tempMax), lineStyle: { color: '#ef4444', width: 2.5 } },
-      { name: '电流(A)', type: 'line', smooth: true, showSymbol: false, yAxisIndex: 1, data: history.value.map(d => d.current), lineStyle: { color: '#6366f1', width: 2 } },
-      { name: 'SOC(%)', type: 'line', smooth: true, showSymbol: false, yAxisIndex: 1, data: history.value.map(d => d.soc), lineStyle: { color: '#22d3a0', width: 2 } },
-      // 游标
-      { type: 'line', data: [], markLine: {
-        symbol: 'none',
-        animation: false,
-        data: [{
-          xAxis: cursor.value,
-          lineStyle: { color: '#06b6d4', width: 2, type: 'solid' },
-          label: { show: true, position: 'end', formatter: '当前', color: '#06b6d4', fontSize: 11 }
-        }]
-      } },
-      // 事件标注
-      { type: 'line', data: [], markPoint: {
-        symbol: 'pin', symbolSize: 30,
-        label: { show: false },
-        data: incidents.value.map(e => ({
-          xAxis: e.idx, yAxis: history.value[e.idx]?.tempMax || 30,
-          itemStyle: { color: e.level === 'err' ? '#ef4444' : e.level === 'warn' ? '#f59e0b' : e.level === 'ok' ? '#22d3a0' : '#015eea' },
-          name: e.label
-        }))
-      } }
+      { name: 'PACK 电压', type: 'line', smooth: true, showSymbol: false, sampling: 'lttb', data: history.value.map(d => d.voltage), lineStyle: { color: '#015eea', width: 2 }, areaStyle: { color: 'rgba(1,94,234,0.1)' } },
+      { name: '最高温(℃)', type: 'line', smooth: true, showSymbol: false, sampling: 'lttb', data: history.value.map(d => d.tempMax), lineStyle: { color: '#ef4444', width: 2.4 } },
+      { name: '电流(A)',  type: 'line', smooth: true, showSymbol: false, sampling: 'lttb', yAxisIndex: 1, data: history.value.map(d => d.current), lineStyle: { color: '#6366f1', width: 2 } },
+      { name: 'SOC(%)',   type: 'line', smooth: true, showSymbol: false, sampling: 'lttb', yAxisIndex: 1, data: history.value.map(d => d.soc), lineStyle: { color: '#22d3a0', width: 2 } },
+      { name: '__cursor', type: 'line', data: [], silent: true, markLine: cursorMarkLine() },
+      { name: '__events', type: 'line', data: [], silent: true, markPoint: incidentMarkPoint() }
+    ]
+  }, true)
+}
+
+/** 游标移动专用：只更新第 5 条 series 的 markLine，不重建整张图 */
+function updateTrendCursor() {
+  if (!trendChart) return
+  trendChart.setOption({
+    series: [
+      {}, {}, {}, {},
+      { markLine: cursorMarkLine() }
     ]
   })
 }
@@ -211,13 +337,26 @@ function renderCells() {
   if (!cellChart) return
   const data = cellsAt.value
   cellChart.setOption({
+    textStyle: { fontFamily: 'PingFang SC, -apple-system, "Segoe UI", system-ui, sans-serif' },
+    animation: false,
     tooltip: {
       trigger: 'axis', axisPointer: { type: 'shadow' },
+      backgroundColor: 'rgba(16,21,46,0.92)', borderColor: 'transparent',
+      textStyle: { color: '#fff', fontSize: 12 },
       formatter: (p) => `电芯 #${p[0].dataIndex + 1}<br/>电压 <b>${p[0].value.toFixed(3)} V</b>`
     },
-    grid: { left: 42, right: 14, top: 24, bottom: 24 },
-    xAxis: { type: 'category', data: data.map((_, i) => i + 1), axisLabel: { color: '#8a93a8', fontSize: 9, interval: 12 } },
-    yAxis: { type: 'value', min: 3.20, max: 3.40, splitLine: { lineStyle: { color: '#eef0f7' } }, axisLabel: { color: '#525c75', fontSize: 10 } },
+    grid: { left: 46, right: 14, top: 14, bottom: 28 },
+    xAxis: {
+      type: 'category', data: data.map((_, i) => i + 1),
+      axisLabel: { color: '#8a93a8', fontSize: 11, interval: 12, margin: 8 },
+      axisLine: { lineStyle: { color: '#dadfeb' } },
+      axisTick: { show: false }
+    },
+    yAxis: {
+      type: 'value', min: 3.20, max: 3.40,
+      splitLine: { lineStyle: { color: '#eef0f7' } },
+      axisLabel: { color: '#525c75', fontSize: 11 }
+    },
     series: [{
       type: 'bar', barWidth: '85%', data,
       itemStyle: {
@@ -232,18 +371,24 @@ function renderHeat() {
   const arr = []
   for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) arr.push([x, y, tempGridAt.value[y * 4 + x]])
   heatChart.setOption({
-    tooltip: { formatter: (p) => `T${p.value[1]*4+p.value[0]+1}<br/>${p.value[2].toFixed(1)}℃` },
-    grid: { left: 36, right: 12, top: 22, bottom: 30 },
-    xAxis: { type: 'category', data: ['L1','L2','L3','L4'], axisLine: { show: false }, axisTick: { show: false }, axisLabel: { color: '#525c75', fontSize: 11 } },
-    yAxis: { type: 'category', data: ['前','中前','中后','后'], axisLine: { show: false }, axisTick: { show: false }, axisLabel: { color: '#525c75', fontSize: 11 } },
+    textStyle: { fontFamily: 'PingFang SC, -apple-system, "Segoe UI", system-ui, sans-serif' },
+    animation: false,
+    tooltip: {
+      backgroundColor: 'rgba(16,21,46,0.92)', borderColor: 'transparent',
+      textStyle: { color: '#fff', fontSize: 12 },
+      formatter: (p) => `T${p.value[1]*4+p.value[0]+1}<br/>${p.value[2].toFixed(1)}℃`
+    },
+    grid: { left: 40, right: 12, top: 14, bottom: 32 },
+    xAxis: { type: 'category', data: ['L1','L2','L3','L4'], axisLine: { show: false }, axisTick: { show: false }, axisLabel: { color: '#525c75', fontSize: 12 } },
+    yAxis: { type: 'category', data: ['前','中前','中后','后'], axisLine: { show: false }, axisTick: { show: false }, axisLabel: { color: '#525c75', fontSize: 12 } },
     visualMap: {
       min: 25, max: 70, calculable: false, orient: 'horizontal', left: 'center', bottom: 0,
       inRange: { color: ['#22d3a0', '#06b6d4', '#015eea', '#f59e0b', '#ef4444'] },
-      textStyle: { color: '#525c75', fontSize: 10 }, itemWidth: 8, itemHeight: 80
+      textStyle: { color: '#525c75', fontSize: 11 }, itemWidth: 10, itemHeight: 80
     },
     series: [{
       type: 'heatmap', data: arr,
-      label: { show: true, formatter: (p) => p.value[2].toFixed(1), color: '#fff', fontSize: 10, fontWeight: 600 },
+      label: { show: true, formatter: (p) => p.value[2].toFixed(1), color: '#fff', fontSize: 12, fontWeight: 600 },
       itemStyle: { borderRadius: 6, borderWidth: 2, borderColor: '#fff' }
     }]
   })
@@ -251,25 +396,61 @@ function renderHeat() {
 
 function renderAll() { renderTrend(); renderCells(); renderHeat() }
 
-watch(cursor, () => { renderCells(); renderHeat(); renderTrend() })
+// 游标变化只更新 markLine + 单体 + 温度场（不重建趋势全量）
+watch(cursor, () => { renderCells(); renderHeat(); updateTrendCursor() })
 
 function onResize() { trendChart?.resize(); cellChart?.resize(); heatChart?.resize() }
 
 onMounted(() => {
-  trendChart = echarts.init(trendEl.value)
-  cellChart = echarts.init(cellEl.value)
-  heatChart = echarts.init(heatEl.value)
+  // 显式提高 DPR，防止高分屏 canvas 字体糊；renderer 锁定 canvas
+  const initOpts = {
+    renderer: 'canvas',
+    devicePixelRatio: Math.max(2, window.devicePixelRatio || 1)
+  }
+  trendChart = echarts.init(trendEl.value, null, initOpts)
+  cellChart  = echarts.init(cellEl.value,  null, initOpts)
+  heatChart  = echarts.init(heatEl.value,  null, initOpts)
   renderAll()
   window.addEventListener('resize', onResize)
+  window.addEventListener('keydown', onKey)
 })
 onBeforeUnmount(() => {
   pause()
   window.removeEventListener('resize', onResize)
+  window.removeEventListener('keydown', onKey)
   trendChart?.dispose(); cellChart?.dispose(); heatChart?.dispose()
 })
 
 /* ---------- 拖拽进度条 ---------- */
 function onSliderInput(v) { cursor.value = Math.round(v) }
+
+/* ---------- KPI 项定义 ---------- */
+const kpiItems = [
+  { key: 'voltage',      label: 'PACK 电压',  unit: 'V',  color: '#015eea' },
+  { key: 'current',      label: 'PACK 电流',  unit: 'A',  color: '#6366f1' },
+  { key: 'tempMax',      label: '最高温度',   unit: '℃', color: '#ef4444' },
+  { key: 'tempDelta',    label: '温差',       unit: '℃', color: '#f59e0b' },
+  { key: 'voltageDelta', label: '压差',       unit: 'mV', color: '#f59e0b' },
+  { key: 'insulation',   label: '绝缘电阻',   unit: 'kΩ', color: '#22d3a0' },
+  { key: 'soc',          label: 'SOC',        unit: '%',  color: '#22d3a0' }
+]
+function kpiValue(k) {
+  const c = cur.value
+  if (k === 'tempDelta') return (c.tempMax - c.tempMin).toFixed(1)
+  if (k === 'voltage')   return c.voltage
+  if (k === 'soc')       return c.soc
+  return c[k]
+}
+function kpiClass(k) {
+  const c = cur.value
+  if (k === 'current')      return c.current < 0 ? 'neg' : ''
+  if (k === 'tempMax')      return c.tempMax > 45 ? 'err' : c.tempMax > 35 ? 'warn' : ''
+  if (k === 'tempDelta')    return (c.tempMax - c.tempMin) > 5 ? 'warn' : ''
+  if (k === 'voltageDelta') return c.voltageDelta > 80 ? 'err' : c.voltageDelta > 50 ? 'warn' : ''
+  if (k === 'insulation')   return c.insulation < 500 ? 'err' : ''
+  if (k === 'soc')          return 'ok'
+  return ''
+}
 </script>
 
 <template>
@@ -285,7 +466,7 @@ function onSliderInput(v) { cursor.value = Math.round(v) }
       </template>
     </PageHeader>
 
-    <!-- 顶部选择条 -->
+    <!-- 顶部选择条 + 快速跳转 -->
     <div class="bar">
       <el-select v-model="stationId" placeholder="站点" style="width:200px">
         <el-option v-for="s in stations" :key="s.id" :label="s.name" :value="s.id" />
@@ -301,13 +482,21 @@ function onSliderInput(v) { cursor.value = Math.round(v) }
         end-placeholder="结束时间"
         style="width:380px"
       />
+      <div class="quick-jump">
+        <span class="qj-l">快速定位</span>
+        <el-button-group>
+          <el-button size="small" :icon="ArrowLeftBold" @click="jumpBefore5min">事故前 5min</el-button>
+          <el-button size="small" type="danger" plain :icon="Aim" @click="jumpAtIncident">事故时刻</el-button>
+          <el-button size="small" @click="jumpAfter2min">事故后 2min<el-icon style="margin-left:4px"><ArrowRightBold /></el-icon></el-button>
+        </el-button-group>
+      </div>
       <div class="bar-tip">
         <el-icon><Clock /></el-icon>
-        共 {{ totalSec }} 秒 / {{ history.length }} 数据点 · 1Hz 采样
+        共 {{ totalSec }} 秒 / {{ history.length }} 数据点 · 1Hz
       </div>
     </div>
 
-    <!-- 当前帧 KPI -->
+    <!-- 当前帧 KPI（每项带 ±30s sparkline） -->
     <div class="cur-card">
       <div class="cur-time">
         <div class="ct-l">回放时刻</div>
@@ -316,13 +505,20 @@ function onSliderInput(v) { cursor.value = Math.round(v) }
       </div>
       <div class="cur-divider" />
       <div class="cur-grid">
-        <div class="cur-item"><div class="ci-l">PACK 电压</div><div class="ci-v">{{ cur.voltage }} <span>V</span></div></div>
-        <div class="cur-item"><div class="ci-l">PACK 电流</div><div class="ci-v" :class="{neg:cur.current<0}">{{ cur.current }} <span>A</span></div></div>
-        <div class="cur-item"><div class="ci-l">最高温度</div><div class="ci-v" :class="{warn:cur.tempMax>35,err:cur.tempMax>45}">{{ cur.tempMax }} <span>℃</span></div></div>
-        <div class="cur-item"><div class="ci-l">温差</div><div class="ci-v" :class="{warn:cur.tempMax-cur.tempMin>5}">{{ (cur.tempMax-cur.tempMin).toFixed(1) }} <span>℃</span></div></div>
-        <div class="cur-item"><div class="ci-l">压差</div><div class="ci-v" :class="{warn:cur.voltageDelta>50,err:cur.voltageDelta>80}">{{ cur.voltageDelta }} <span>mV</span></div></div>
-        <div class="cur-item"><div class="ci-l">绝缘电阻</div><div class="ci-v" :class="{err:cur.insulation<500}">{{ cur.insulation }} <span>kΩ</span></div></div>
-        <div class="cur-item"><div class="ci-l">SOC</div><div class="ci-v" style="color:#22d3a0">{{ cur.soc }} <span>%</span></div></div>
+        <div
+          v-for="k in kpiItems" :key="k.key"
+          class="cur-item"
+        >
+          <div class="ci-l">{{ k.label }}</div>
+          <div class="ci-v" :class="kpiClass(k.key)">
+            {{ kpiValue(k.key) }} <span>{{ k.unit }}</span>
+          </div>
+          <svg class="ci-spark" :viewBox="`0 0 ${SPARK_W} ${SPARK_H}`" preserveAspectRatio="none">
+            <path :d="sparkAreaPath(k.key)" :fill="k.color" fill-opacity="0.08" />
+            <path :d="sparkPath(k.key)" :stroke="k.color" stroke-width="1.2" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+            <circle :cx="sparkDot(k.key).x" :cy="sparkDot(k.key).y" r="1.8" :fill="k.color" stroke="#fff" stroke-width="0.8" />
+          </svg>
+        </div>
       </div>
     </div>
 
@@ -354,43 +550,53 @@ function onSliderInput(v) { cursor.value = Math.round(v) }
     <!-- 控制台 + 时间轴 -->
     <div class="player">
       <div class="player-controls">
-        <el-button circle :icon="ArrowLeftBold" @click="rewind(10)" />
-        <el-button
-          size="large" circle type="primary"
-          :icon="playing ? VideoPause : VideoPlay"
-          @click="toggle"
-        />
-        <el-button circle :icon="ArrowRightBold" @click="forward(10)" />
-        <el-button circle :icon="Refresh" @click="cursor = 0; pause()" />
+        <el-tooltip content="后退 10s ( ← )" placement="top" effect="dark">
+          <el-button circle :icon="ArrowLeftBold" @click="rewind(10)" />
+        </el-tooltip>
+        <el-tooltip :content="playing ? '暂停 ( Space )' : '播放 ( Space )'" placement="top" effect="dark">
+          <el-button
+            size="large" circle type="primary"
+            :icon="playing ? VideoPause : VideoPlay"
+            @click="toggle"
+          />
+        </el-tooltip>
+        <el-tooltip content="前进 10s ( → )" placement="top" effect="dark">
+          <el-button circle :icon="ArrowRightBold" @click="forward(10)" />
+        </el-tooltip>
+        <el-tooltip content="回到起点" placement="top" effect="dark">
+          <el-button circle :icon="Refresh" @click="cursor = 0; pause()" />
+        </el-tooltip>
       </div>
       <div class="player-track">
         <div class="track-info">
           <span class="tk-time">{{ curTime }}</span>
-          <span class="tk-pct">{{ cursorPct.toFixed(1) }}%</span>
+          <span class="tk-meta">{{ cursorPct.toFixed(1) }}% · {{ cursor + 1 }} / {{ totalSec }}</span>
         </div>
         <el-slider
           :model-value="cursor"
           @update:model-value="onSliderInput"
           :min="0" :max="totalSec - 1"
           :show-tooltip="false"
-          :marks="incidents.reduce((acc, e) => { acc[e.idx] = ''; return acc }, {})"
         />
         <div class="track-marks">
-          <div
+          <el-tooltip
             v-for="(e, i) in incidents" :key="i"
-            class="mark" :class="e.level"
-            :style="{ left: (e.idx / (totalSec - 1) * 100) + '%' }"
-            @click="jumpTo(e.idx)"
-            :title="`${e.time} · ${e.label}`"
+            :content="`${e.time} · ${e.label}`"
+            placement="bottom"
+            effect="dark"
           >
-            <div class="mk-dot" />
-            <div class="mk-label">{{ e.label }}</div>
-            <div class="mk-time">{{ e.time }}</div>
-          </div>
+            <div
+              class="mark" :class="e.level"
+              :style="{ left: (e.idx / (totalSec - 1) * 100) + '%' }"
+              @click="jumpTo(e.idx)"
+            >
+              <div class="mk-dot" />
+            </div>
+          </el-tooltip>
         </div>
       </div>
       <div class="player-speed">
-        <span class="ps-l">倍速</span>
+        <span class="ps-l">倍速 ( +/- )</span>
         <div class="ps-options">
           <button
             v-for="s in speeds" :key="s"
@@ -405,7 +611,9 @@ function onSliderInput(v) { cursor.value = Math.round(v) }
     <div class="card">
       <div class="card-head">
         <div class="ch-title">关键事件序列 · 点击跳转</div>
-        <el-tag size="small" effect="light">{{ incidents.length }} 条</el-tag>
+        <div class="hk-hint">
+          <kbd>Space</kbd> 播放 <kbd>←</kbd>/<kbd>→</kbd> ±10s <kbd>+</kbd>/<kbd>-</kbd> 倍速
+        </div>
       </div>
       <div class="ev-flow">
         <div
@@ -430,32 +638,42 @@ function onSliderInput(v) { cursor.value = Math.round(v) }
 .bar {
   background: $bg-card; border: 1px solid $border-soft; border-radius: $radius;
   padding: 12px 16px; margin-bottom: 16px; box-shadow: $shadow-card;
-  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
 }
 .bar-tip { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: $text-muted; }
+.quick-jump {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding-left: 12px; border-left: 1px dashed $border-soft;
+  .qj-l { font-size: 12px; color: $text-muted; }
+}
 
 /* === 当前帧 KPI === */
 .cur-card {
   background: linear-gradient(135deg, $bg-card 0%, #eff6ff 100%);
   border: 1px solid $border-soft; border-radius: $radius;
-  padding: 18px 22px; margin-bottom: 16px; box-shadow: $shadow-card;
-  display: flex; gap: 24px; align-items: stretch;
+  padding: 14px 18px; margin-bottom: 16px; box-shadow: $shadow-card;
+  display: flex; gap: 20px; align-items: stretch;
 }
-.cur-time { padding-right: 24px; }
-.ct-l { font-size: 12px; color: $text-muted; }
-.ct-v { font-family: $font-num; font-variant-numeric: tabular-nums; font-size: 34px; font-weight: 600; color: $brand-blue; letter-spacing: -1px; line-height: 1.1; margin-top: 2px; }
-.ct-pos { font-family: $font-num; font-size: 12px; color: $text-muted; margin-top: 4px; }
-.cur-divider { width: 1px; background: $border-soft; }
-.cur-grid { flex: 1; display: grid; grid-template-columns: repeat(7, 1fr); gap: 18px; align-items: center; }
-.cur-item { }
-.ci-l { font-size: 12px; color: $text-muted; }
+.cur-time { padding-right: 20px; flex-shrink: 0; }
+.ct-l { font-size: 12px; color: $text-muted; line-height: 1.2; }
+.ct-v { font-family: $font-num; font-variant-numeric: tabular-nums; font-size: 36px; font-weight: 600; color: $brand-blue; letter-spacing: -1px; line-height: 1.1; margin-top: 2px; }
+.ct-pos { font-family: $font-num; font-size: 12px; color: $text-muted; margin-top: 2px; }
+.cur-divider { width: 1px; background: $border-soft; flex-shrink: 0; }
+.cur-grid { flex: 1; display: grid; grid-template-columns: repeat(7, 1fr); gap: 16px; align-items: stretch; }
+.cur-item { display: flex; flex-direction: column; min-width: 0; }
+.ci-l { font-size: 12px; color: $text-muted; line-height: 1.2; }
 .ci-v {
   font-family: $font-num; font-variant-numeric: tabular-nums;
-  font-size: 22px; font-weight: 600; color: $text-primary; margin-top: 4px;
-  span { font-size: 12px; color: $text-muted; font-weight: 400; }
+  font-size: 26px; font-weight: 600; color: $text-primary; margin-top: 2px; line-height: 1.1;
+  span { font-size: 12px; color: $text-muted; font-weight: 400; margin-left: 2px; }
   &.neg { color: #015eea; }
   &.warn { color: #f59e0b; }
   &.err { color: #ef4444; }
+  &.ok { color: #22d3a0; }
+}
+.ci-spark {
+  display: block; width: 100%; height: 18px;
+  margin-top: 6px;
 }
 
 /* === Cards === */
@@ -475,55 +693,87 @@ function onSliderInput(v) { cursor.value = Math.round(v) }
 .chart { width: 100%; height: 340px; }
 .chart.h160 { height: 160px; }
 
-/* === Player === */
+/* === Player（浅色重构） === */
 .player {
-  background: linear-gradient(135deg, $nav-bg 0%, #0a0f24 100%);
+  background: linear-gradient(135deg, #ffffff 0%, #eff6ff 60%, #e0ecff 100%);
+  border: 1px solid $border-soft;
   border-radius: $radius;
-  padding: 18px 22px;
+  padding: 16px 22px 20px;
   margin-bottom: 16px;
   display: grid;
   grid-template-columns: auto 1fr auto;
-  gap: 22px; align-items: center;
-  color: #fff;
+  gap: 24px; align-items: center;
+  box-shadow: $shadow-card;
+  position: relative; overflow: hidden;
+  &::before {
+    content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 4px;
+    background: $grad-cyan;
+  }
 }
-.player-controls { display: flex; gap: 8px; align-items: center; }
-.player-controls :deep(.el-button) { background: rgba(255,255,255,0.08); border-color: rgba(255,255,255,0.15); color: #fff; }
-.player-controls :deep(.el-button:hover) { background: rgba(255,255,255,0.16); }
-.player-controls :deep(.el-button--primary) { background: $grad-cyan; border-color: transparent; }
+.player-controls { display: flex; gap: 8px; align-items: center; padding-left: 4px; }
+.player-controls :deep(.el-button) {
+  background: #fff; border-color: $border-soft; color: $text-primary;
+  box-shadow: 0 1px 3px rgba(16,21,46,0.04);
+}
+.player-controls :deep(.el-button:hover) {
+  background: #fff; border-color: $brand-blue; color: $brand-blue;
+}
+.player-controls :deep(.el-button--primary) {
+  background: $grad-cyan; border-color: transparent; color: #fff;
+  box-shadow: 0 4px 14px rgba(6,182,212,0.4);
+}
+.player-controls :deep(.el-button--primary:hover) {
+  background: linear-gradient(135deg, #0891b2 0%, #1e40af 100%);
+}
 
-.player-track { min-width: 0; }
-.track-info { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-family: $font-num; }
-.tk-time { font-size: 16px; font-weight: 600; color: $brand-cyan; }
-.tk-pct { font-size: 12px; color: rgba(255,255,255,0.6); }
-.player-track :deep(.el-slider__runway) { background: rgba(255,255,255,0.12); height: 6px; }
+.player-track { min-width: 0; padding: 0 4px; }
+.track-info { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; font-family: $font-num; }
+.tk-time { font-size: 20px; font-weight: 600; color: $brand-blue; letter-spacing: -0.5px; }
+.tk-meta { font-size: 12px; color: $text-muted; }
+.player-track :deep(.el-slider__runway) { background: rgba(1,94,234,0.1); height: 6px; }
 .player-track :deep(.el-slider__bar) { background: $grad-cyan; height: 6px; }
-.player-track :deep(.el-slider__button) { background: $brand-cyan; border-color: #fff; width: 14px; height: 14px; }
-.player-track :deep(.el-slider__marks-text) { color: rgba(255,255,255,0.3); font-size: 10px; }
-.track-marks { position: relative; height: 32px; margin-top: 6px; }
+.player-track :deep(.el-slider__button) { background: #fff; border: 2px solid $brand-cyan; width: 16px; height: 16px; box-shadow: 0 2px 8px rgba(6,182,212,0.35); }
+.track-marks { position: relative; height: 16px; margin-top: 6px; }
 .mark {
   position: absolute; top: 0; transform: translateX(-50%);
-  display: flex; flex-direction: column; align-items: center; gap: 2px;
-  cursor: pointer; font-size: 9px;
-  white-space: nowrap;
-  &:hover .mk-label { color: $brand-cyan; }
+  cursor: pointer; padding: 2px;
+  &:hover .mk-dot {
+    transform: scale(1.5);
+    box-shadow: 0 0 0 4px rgba(255,255,255,0.7), 0 2px 6px rgba(0,0,0,0.2);
+  }
   &.err .mk-dot { background: #ef4444; }
   &.warn .mk-dot { background: #f59e0b; }
   &.info .mk-dot { background: #015eea; }
   &.ok .mk-dot { background: #22d3a0; }
 }
-.mk-dot { width: 8px; height: 8px; border-radius: 50%; box-shadow: 0 0 0 3px rgba(255,255,255,0.15); }
-.mk-label { color: rgba(255,255,255,0.55); }
-.mk-time { color: rgba(255,255,255,0.35); font-family: $font-num; }
+.mk-dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  box-shadow: 0 0 0 3px #fff, 0 1px 3px rgba(0,0,0,0.15);
+  transition: transform 0.2s, box-shadow 0.2s;
+}
 
 .player-speed { text-align: right; }
-.ps-l { font-size: 11px; color: rgba(255,255,255,0.55); display: block; margin-bottom: 6px; }
-.ps-options { display: flex; gap: 4px; }
+.ps-l { font-size: 11px; color: $text-muted; display: block; margin-bottom: 6px; letter-spacing: 0.3px; }
+.ps-options { display: inline-flex; gap: 2px; background: rgba(255,255,255,0.7); padding: 3px; border-radius: 8px; border: 1px solid $border-soft; }
 .ps-options button {
-  background: transparent; border: 1px solid rgba(255,255,255,0.18);
-  color: rgba(255,255,255,0.7); font-size: 12px; padding: 5px 12px;
-  border-radius: 4px; cursor: pointer; font-family: $font-num;
-  &:hover { background: rgba(255,255,255,0.08); }
-  &.active { background: $grad-cyan; color: #fff; border-color: transparent; }
+  background: transparent; border: none;
+  color: $text-secondary; font-size: 12px; padding: 5px 10px;
+  border-radius: 5px; cursor: pointer; font-family: $font-num; font-weight: 500;
+  transition: all 0.15s;
+  &:hover:not(.active) { background: rgba(1,94,234,0.06); color: $brand-blue; }
+  &.active { background: $grad-cyan; color: #fff; box-shadow: 0 2px 6px rgba(6,182,212,0.35); }
+}
+
+/* === 键盘提示 === */
+.hk-hint {
+  font-size: 11px; color: $text-muted;
+  display: inline-flex; gap: 6px; align-items: center;
+  kbd {
+    display: inline-block; font-family: $font-num; font-size: 10.5px;
+    padding: 1px 6px; border: 1px solid $border-soft; border-bottom-width: 2px;
+    border-radius: 4px; background: $bg-soft; color: $text-secondary;
+    line-height: 1.4;
+  }
 }
 
 /* === 事件流 === */
@@ -555,5 +805,6 @@ function onSliderInput(v) { cursor.value = Math.round(v) }
   .col-2 { grid-column: auto; }
   .player { grid-template-columns: 1fr; gap: 14px; }
   .cur-card { flex-wrap: wrap; }
+  .hk-hint { display: none; }
 }
 </style>

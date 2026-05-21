@@ -1,6 +1,6 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
-import * as echarts from 'echarts'
+import echarts from '@/utils/echarts'
 import PageHeader from '@/components/PageHeader.vue'
 import { stations } from '@/mock/data'
 import {
@@ -282,12 +282,9 @@ const dayStats = computed(() => {
         <span class="st-dot" :style="{ background: curState.color }" />
         <span class="st-label">{{ curState.label }}</span>
       </div>
-      <el-radio-group v-model="state" size="default">
-        <el-radio-button v-for="s in STATES" :key="s.key" :label="s.key">{{ s.label }}</el-radio-button>
-      </el-radio-group>
       <div class="bar-right">
         <el-icon class="pulse"><Lightning /></el-icon>
-        额定容量 250 kW · 当前 {{ Math.abs(pcs.P).toFixed(1) }} kW
+        额定容量 <b>250 kW</b> · 当前 <b>{{ Math.abs(pcs.P).toFixed(1) }} kW</b>
       </div>
     </div>
 
@@ -305,8 +302,22 @@ const dayStats = computed(() => {
       <div class="kpi-block ac">
         <div class="kb-title">交流侧 AC</div>
         <div class="kb-grid kb-grid-4">
-          <div class="kb"><div class="kb-l">Ua / Ub / Uc</div><div class="kb-v sm">{{ pcs.acVoltageA }} <s>/</s> {{ pcs.acVoltageB }} <s>/</s> {{ pcs.acVoltageC }}<span>V</span></div></div>
-          <div class="kb"><div class="kb-l">Ia / Ib / Ic</div><div class="kb-v sm">{{ pcs.acCurrentA }} <s>/</s> {{ pcs.acCurrentB }} <s>/</s> {{ pcs.acCurrentC }}<span>A</span></div></div>
+          <div class="kb">
+            <div class="kb-l">三相电压</div>
+            <div class="kb-phase">
+              <div><i style="background:#ef4444" />A <b>{{ pcs.acVoltageA }}</b><span>V</span></div>
+              <div><i style="background:#22d3a0" />B <b>{{ pcs.acVoltageB }}</b><span>V</span></div>
+              <div><i style="background:#015eea" />C <b>{{ pcs.acVoltageC }}</b><span>V</span></div>
+            </div>
+          </div>
+          <div class="kb">
+            <div class="kb-l">三相电流</div>
+            <div class="kb-phase">
+              <div><i style="background:#ef4444" />A <b>{{ pcs.acCurrentA }}</b><span>A</span></div>
+              <div><i style="background:#22d3a0" />B <b>{{ pcs.acCurrentB }}</b><span>A</span></div>
+              <div><i style="background:#015eea" />C <b>{{ pcs.acCurrentC }}</b><span>A</span></div>
+            </div>
+          </div>
           <div class="kb"><div class="kb-l">频率</div><div class="kb-v">{{ pcs.freq.toFixed(3) }}<span>Hz</span></div></div>
           <div class="kb"><div class="kb-l">功率因数</div><div class="kb-v">{{ pcs.pf.toFixed(3) }}</div></div>
         </div>
@@ -431,26 +442,34 @@ const dayStats = computed(() => {
 .kpi-grid { display: grid; grid-template-columns: 1fr 2fr 2fr; gap: 14px; margin-bottom: 16px; }
 .kpi-block {
   background: $bg-card; border: 1px solid $border-soft; border-radius: $radius;
-  padding: 16px 18px; box-shadow: $shadow-card;
+  padding: 14px 16px 14px 20px; box-shadow: $shadow-card;
   position: relative; overflow: hidden;
   &::before { content: ''; position: absolute; top: 0; left: 0; bottom: 0; width: 3px; background: $grad-cyan; }
   &.dc::before { background: linear-gradient(180deg, #6366f1, #015eea); }
   &.ac::before { background: linear-gradient(180deg, #ef4444, #f59e0b); }
   &.pwr::before { background: linear-gradient(180deg, #22d3a0, #06b6d4); }
 }
-.kb-title { font-size: 12px; color: $text-muted; letter-spacing: 2px; margin-bottom: 12px; }
-.kb-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+.kb-title { font-size: 12px; color: $text-muted; letter-spacing: 2px; margin-bottom: 10px; }
+.kb-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; align-items: end; }
 .kb-grid-4 { grid-template-columns: repeat(4, 1fr); }
-.kb-l { font-size: 11px; color: $text-muted; }
+.kb-l { font-size: 12px; color: $text-muted; line-height: 1.2; }
 .kb-v {
   font-family: $font-num; font-variant-numeric: tabular-nums;
-  font-size: 20px; font-weight: 600; margin-top: 3px;
+  font-size: 28px; font-weight: 600; margin-top: 2px; line-height: 1.1;
   letter-spacing: -0.3px;
-  &.sm { font-size: 14px; line-height: 1.3; }
-  &.sm s { color: $text-muted; text-decoration: none; }
   &.neg { color: #015eea; }
   &.ok { color: #22d3a0; }
-  span { font-size: 11px; color: $text-muted; font-weight: 400; margin-left: 3px; }
+  span { font-size: 12px; color: $text-muted; font-weight: 400; margin-left: 4px; }
+}
+.kb-phase {
+  margin-top: 4px;
+  display: flex; flex-direction: column; gap: 2px;
+  font-family: $font-num; font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  > div { display: flex; align-items: center; gap: 6px; line-height: 1.5; color: $text-secondary; }
+  i { display: inline-block; width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  b { font-weight: 600; color: $text-primary; margin-left: auto; font-size: 14px; }
+  span { font-size: 11px; color: $text-muted; margin-left: 3px; min-width: 14px; }
 }
 
 /* === Charts === */

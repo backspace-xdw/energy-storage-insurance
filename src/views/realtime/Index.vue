@@ -1,7 +1,7 @@
 <script setup>
 import { onMounted, onBeforeUnmount, ref, reactive, computed, watch } from 'vue'
 import dayjs from 'dayjs'
-import * as echarts from 'echarts'
+import echarts from '@/utils/echarts'
 import PageHeader from '@/components/PageHeader.vue'
 import { stations } from '@/mock/data'
 import {
@@ -388,7 +388,7 @@ function fullscreen() {
       <div class="bar-right">
         <div class="live">
           <span class="live-dot" :class="{ on: updating }" />
-          {{ updating ? `实时采集中 ${updateHz}Hz` : '已暂停' }}
+          {{ updating ? '实时采集中' : '已暂停' }}
         </div>
         <el-segmented v-model="updateHz" :options="[{value:1,label:'1Hz'},{value:2,label:'2Hz'},{value:5,label:'5Hz'}]" />
       </div>
@@ -443,12 +443,14 @@ function fullscreen() {
           <el-tag size="small" type="success" effect="light">{{ messages.length }} 帧/s</el-tag>
         </div>
         <div class="msg-list">
-          <div class="msg-item" v-for="(m, i) in messages.slice(0, 14)" :key="i" :class="{ fresh: i === 0 }">
-            <span class="mi-time">{{ m.time }}</span>
-            <span class="mi-proto" :class="m.proto.toLowerCase().replace(/[^a-z]/g,'')">{{ m.proto }}</span>
-            <span class="mi-id">{{ m.id }}</span>
-            <span class="mi-name">{{ m.name }}</span>
-            <span class="mi-data">{{ m.data }}</span>
+          <div class="msg-item" v-for="(m, i) in messages.slice(0, 10)" :key="i" :class="{ fresh: i === 0 }">
+            <div class="mi-row">
+              <span class="mi-time">{{ m.time }}</span>
+              <span class="mi-proto" :class="m.proto.toLowerCase().replace(/[^a-z]/g,'')">{{ m.proto }}</span>
+              <span class="mi-id">{{ m.id }}</span>
+              <span class="mi-name">{{ m.name }}</span>
+            </div>
+            <div class="mi-data">{{ m.data }}</div>
           </div>
         </div>
       </div>
@@ -551,28 +553,28 @@ function fullscreen() {
 }
 .kpi-cell {
   background: $bg-card; border: 1px solid $border-soft;
-  border-radius: $radius; padding: 16px 18px;
+  border-radius: $radius; padding: 14px 16px;
   box-shadow: $shadow-card;
   position: relative; overflow: hidden;
   &::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: $grad-cyan; opacity: 0.7; }
 }
 .kpi-soc { background: linear-gradient(135deg, #fff 0%, #f0fdf9 100%); }
 .kpi-soc::after { background: linear-gradient(90deg, #22d3a0, #06b6d4); opacity: 1; }
-.kc-label { font-size: 12px; color: $text-muted; }
+.kc-label { font-size: 13px; color: $text-muted; line-height: 1.2; }
 .kc-val {
   font-family: $font-num; font-variant-numeric: tabular-nums lining-nums;
-  font-size: 28px; font-weight: 600; color: $text-primary;
-  margin-top: 4px; line-height: 1.1;
+  font-size: 34px; font-weight: 600; color: $text-primary;
+  margin-top: 2px; line-height: 1.1;
   letter-spacing: -0.5px;
   span { font-size: 13px; color: $text-muted; font-weight: 400; margin-left: 4px; }
   &.warn { color: #ef4444; }
   &.neg { color: #015eea; }
 }
-.kc-sub { font-size: 11px; color: $text-muted; margin-top: 6px; }
+.kc-sub { font-size: 12px; color: $text-muted; margin-top: 4px; line-height: 1.2; }
 .kc-sub b { color: $text-primary; }
 .kc-sub b.warn { color: #ef4444; }
 .kc-sub.ok { color: #22d3a0; }
-.kc-bar { margin-top: 8px; height: 4px; background: rgba(34,211,160,0.15); border-radius: 2px; overflow: hidden; }
+.kc-bar { margin-top: 6px; height: 4px; background: rgba(34,211,160,0.15); border-radius: 2px; overflow: hidden; }
 .kc-bar > div { height: 100%; background: linear-gradient(90deg, #22d3a0, #06b6d4); transition: width 0.4s; }
 
 /* === Cards === */
@@ -597,36 +599,39 @@ function fullscreen() {
 /* === 报文流 === */
 .msg-list {
   flex: 1; min-height: 0;
-  display: flex; flex-direction: column; gap: 2px;
+  display: flex; flex-direction: column; gap: 4px;
   font-family: $font-num;
-  overflow: hidden;
+  overflow-y: auto;
+  max-height: 260px;
+  margin: 0 -4px; padding: 0 4px;
+  &::-webkit-scrollbar { width: 4px; }
+  &::-webkit-scrollbar-thumb { background: rgba(0,0,0,.12); border-radius: 2px; }
 }
 .msg-item {
-  display: grid;
-  grid-template-columns: 78px 70px 110px 1fr;
-  grid-template-rows: auto auto;
-  gap: 0 8px;
-  padding: 5px 8px;
-  font-size: 11px;
-  line-height: 1.4;
-  border-radius: 4px;
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 6px 10px;
+  font-size: 12px;
+  line-height: 1.35;
+  border-radius: 6px;
+  border-left: 2px solid transparent;
   transition: background 0.3s;
-  &.fresh { background: rgba(6,182,212,0.1); animation: msgFlash 1s ease; }
+  &.fresh { background: rgba(6,182,212,0.1); animation: msgFlash 1s ease; border-left-color: #06b6d4; }
 }
 @keyframes msgFlash { 0% { background: rgba(34,211,160,0.25); } 100% { background: rgba(6,182,212,0.1); } }
-.mi-time { color: $text-muted; }
-.mi-proto { font-weight: 600; font-size: 10px; padding: 1px 5px; border-radius: 3px; text-align: center;
+.mi-row { display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; min-width: 0; }
+.mi-time { color: $text-muted; font-size: 11.5px; flex-shrink: 0; }
+.mi-proto { font-weight: 600; font-size: 10.5px; padding: 1px 6px; border-radius: 3px; text-align: center; flex-shrink: 0;
   &.canj1939 { background: rgba(1,94,234,0.12); color: #015eea; }
   &.opcua { background: rgba(99,102,241,0.12); color: #6366f1; }
   &.mqtt { background: rgba(6,182,212,0.12); color: #0891b2; }
 }
-.mi-id { color: $brand-blue; font-weight: 500; }
-.mi-name { color: $text-secondary; }
-.mi-data { grid-column: 1 / -1; color: $text-muted; font-size: 10.5px; letter-spacing: 0.5px; padding-left: 78px; margin-top: -2px; }
+.mi-id { color: $brand-blue; font-weight: 500; font-size: 11.5px; flex-shrink: 0; }
+.mi-name { color: $text-secondary; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+.mi-data { color: $text-muted; font-size: 11px; letter-spacing: 0.5px; padding-left: 0; }
 
 /* === Iface table === */
 .ifaces { width: 100%; border-collapse: collapse; font-size: 13px; }
-.ifaces th, .ifaces td { padding: 10px 12px; border-bottom: 1px solid $border-soft; text-align: left; }
+.ifaces th, .ifaces td { padding: 8px 12px; border-bottom: 1px solid $border-soft; text-align: left; }
 .ifaces th { color: $text-muted; font-weight: 500; font-size: 12px; background: $bg-soft; }
 .ifaces tr:last-child td { border-bottom: none; }
 .ifaces tr:hover td { background: $bg-soft; }
