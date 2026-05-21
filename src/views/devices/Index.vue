@@ -1,26 +1,90 @@
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, computed, onMounted, watch, nextTick } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
 import PageHeader from '@/components/PageHeader.vue'
 import DeviceTabs from './DeviceTabs.vue'
 import { stations, buildStationTree } from '@/mock/data'
-import { Download, Document, Filter, View, Lock } from '@element-plus/icons-vue'
+import { Download, Document, Filter, View, Lock, Star, StarFilled } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
+import { useDevicesPrefStore } from '@/stores/devicesPref'
 
 const router = useRouter()
+const route = useRoute()
+const prefStore = useDevicesPrefStore()
+
 const currentStationId = ref(stations[0].id)
 const tree = ref(null)
 const selectedNode = ref(null)
 const treeRef = ref(null)
+const activeTab = ref(prefStore.lastTab || 'realtime')
 
-function loadTree(id) {
-  tree.value = buildStationTree(id)
-  selectedNode.value = tree.value
+function findNode(root, id) {
+  if (!root) return null
+  if (root.id === id) return root
+  for (const c of root.children || []) {
+    const f = findNode(c, id)
+    if (f) return f
+  }
+  return null
 }
 
-onMounted(() => loadTree(currentStationId.value))
+function loadTree(id, nodeId) {
+  tree.value = buildStationTree(id)
+  const target = nodeId ? findNode(tree.value, nodeId) : null
+  selectedNode.value = target || tree.value
+  if (target) {
+    nextTick(() => {
+      treeRef.value?.setCurrentKey?.(target.id)
+    })
+  }
+}
+
+onMounted(() => {
+  // 优先 URL > Pinia 偏好 > 默认
+  const q = route.query
+  const stationId = q.s || prefStore.lastStationId || stations[0].id
+  const nodeId = q.n || prefStore.lastNodeId || ''
+  const tab = q.tab || prefStore.lastTab || 'realtime'
+  if (stations.find(s => s.id === stationId)) currentStationId.value = stationId
+  activeTab.value = tab
+  loadTree(currentStationId.value, nodeId)
+})
 
 function onSelect(data) { selectedNode.value = data }
+
+/* ---------- 路由/偏好同步 ---------- */
+watch([currentStationId, selectedNode, activeTab], () => {
+  const sid = currentStationId.value
+  const nid = selectedNode.value?.id || ''
+  const tab = activeTab.value
+  prefStore.lastStationId = sid
+  prefStore.lastNodeId = nid
+  prefStore.lastTab = tab
+  // 仅当不同才 replace，避免无谓 history 操作
+  const same = route.query.s === sid && route.query.n === nid && route.query.tab === tab
+  if (!same) {
+    router.replace({ query: { ...route.query, s: sid, n: nid || undefined, tab } })
+  }
+}, { deep: false })
+
+function jumpToFavorite(id) {
+  // 从 id 推断 station
+  // id 形如 st1001-C01-CL1-P07
+  const m = id.match(/^([^-]+)-/)
+  const sid = m ? m[1] : null
+  if (!sid) { ElMessage.error('关注项格式异常'); return }
+  if (sid !== currentStationId.value) {
+    currentStationId.value = sid
+    loadTree(sid, id)
+  } else {
+    const t = findNode(tree.value, id)
+    if (t) {
+      selectedNode.value = t
+      nextTick(() => treeRef.value?.setCurrentKey?.(id))
+    }
+  }
+  activeTab.value = 'realtime'
+}
 
 const filterText = ref('')
 
@@ -128,6 +192,35 @@ function exportLedger() {
       desc="站-舱-簇-PACK 四级数字档案 · 自动构建 · 一键导出"
     >
       <template #actions>
+        <el-popover
+          v-if="prefStore.favoriteCount > 0"
+          placement="bottom-end"
+          :width="320"
+          trigger="click"
+        >
+          <template #reference>
+            <el-button>
+              <el-icon style="color:#f59e0b"><StarFilled /></el-icon>
+              <span style="margin-left:6px">关注 {{ prefStore.favoriteCount }}</span>
+            </el-button>
+          </template>
+          <div class="fav-pop">
+            <div class="fav-head">
+              <span>已关注 PACK</span>
+              <el-button text type="primary" size="small" @click="prefStore.clearFavorites()">清空</el-button>
+            </div>
+            <div class="fav-list">
+              <div
+                v-for="id in prefStore.favoriteList" :key="id"
+                class="fav-item"
+                @click="jumpToFavorite(id)"
+              >
+                <el-icon class="fav-star"><StarFilled /></el-icon>
+                <code class="fav-id">{{ id }}</code>
+              </div>
+            </div>
+          </div>
+        </el-popover>
         <el-button :icon="Document" @click="exportLedger">导出台账清单</el-button>
         <el-button type="primary" :icon="Download">生成初始状态评估报告</el-button>
       </template>
@@ -213,7 +306,7 @@ function exportLedger() {
               <el-button type="primary" :icon="Lock" @click="gotoEvidence">查看承保证据</el-button>
             </div>
           </div>
-          <DeviceTabs :detail="detail" :key="detail.label" />
+          <DeviceTabs :detail="detail" v-model:activeTab="activeTab" :key="detail.label" />
         </div>
       </div>
     </div>
@@ -284,6 +377,20 @@ function exportLedger() {
 .dt-title { font-size: 18px; font-weight: 600; }
 .dt-id { font-size: 12px; color: $text-muted; font-family: $font-num; padding: 2px 8px; background: $bg-soft; border-radius: 4px; }
 .dt-actions { display: flex; gap: 10px; }
+
+/* === Favorites popover === */
+.fav-pop { padding: 4px; }
+.fav-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;
+  font-size: 12px; color: $text-muted;
+}
+.fav-list { display: flex; flex-direction: column; gap: 4px; max-height: 320px; overflow: auto; }
+.fav-item {
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+  border-radius: 6px; cursor: pointer; transition: background 0.15s;
+  &:hover { background: $bg-soft; }
+}
+.fav-star { color: #f59e0b; font-size: 14px; }
+.fav-id { font-size: 12px; color: $text-secondary; font-family: $font-num; }
 
 @media (max-width: 1100px) {
   .layout { grid-template-columns: 1fr; }

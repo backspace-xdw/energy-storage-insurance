@@ -3,13 +3,21 @@ import { ref, computed, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import echarts from '@/utils/echarts'
 import dayjs from 'dayjs'
 import { ElMessage } from 'element-plus'
-import { DataLine, Histogram, List, Refresh, Document, View, Grid } from '@element-plus/icons-vue'
+import { DataLine, Histogram, List, Refresh, Document, View, Grid, Star, StarFilled, Lock } from '@element-plus/icons-vue'
+import { useDevicesPrefStore } from '@/stores/devicesPref'
+import PackCompareDialog from './PackCompareDialog.vue'
 
 const props = defineProps({
-  detail: { type: Object, required: true }
+  detail: { type: Object, required: true },
+  activeTab: { type: String, default: 'realtime' }
 })
+const emit = defineEmits(['update:activeTab'])
 
-const activeTab = ref('realtime')
+const prefStore = useDevicesPrefStore()
+const activeTab = computed({
+  get: () => props.activeTab,
+  set: (v) => emit('update:activeTab', v)
+})
 const histRange = ref('24h')
 
 /* ---------- PACK 列表（station/cabin/cluster 才有） ---------- */
@@ -47,12 +55,33 @@ function rowClass({ row }) {
 
 const packSearch = ref('')
 const packFilter = ref('')
+const onlyFav = ref(false)
 const filteredPacks = computed(() =>
   packList.value.filter(p =>
     (!packSearch.value || p.label.includes(packSearch.value) || p.path.includes(packSearch.value)) &&
-    (!packFilter.value || packHealth(p) === packFilter.value)
+    (!packFilter.value || packHealth(p) === packFilter.value) &&
+    (!onlyFav.value || prefStore.isFavorite(p.id))
   )
 )
+
+/* ---------- 多选 + 对比 ---------- */
+const compareSelection = ref([])
+const compareDialog = ref(false)
+function handleSelectionChange(rows) {
+  // 限制最多 4 个
+  if (rows.length > 4) {
+    ElMessage.warning('对比最多支持 4 个 PACK')
+    // 不直接修改 selection，UI 上保留全部勾选；提示用户取消多余
+  }
+  compareSelection.value = rows
+}
+function openCompare() {
+  if (compareSelection.value.length < 2) {
+    ElMessage.info('请至少勾选 2 个 PACK')
+    return
+  }
+  compareDialog.value = true
+}
 
 function exportPacks() {
   const rows = filteredPacks.value
@@ -76,6 +105,66 @@ function exportPacks() {
   URL.revokeObjectURL(url)
   ElMessage.success(`已导出 ${rows.length} 条 PACK 数据`)
 }
+
+/* ---------- 剩余寿命预测 (PACK) ---------- */
+const ANNUAL_DEGRADATION = 1.5  // %/year，LFP 储能典型
+const EOL_THRESHOLD = 80
+const lifePrediction = computed(() => {
+  if (props.detail.type !== 'pack') return null
+  const info = props.detail.info
+  if (!info) return null
+  const soh = info.soh
+  if (soh <= EOL_THRESHOLD) {
+    return {
+      soh, threshold: EOL_THRESHOLD,
+      degRate: ANNUAL_DEGRADATION,
+      remainingYears: 0,
+      eolDate: '已达 EOL',
+      level: 'err',
+      hint: `健康度 ${soh}% 已低于 EOL 阈值 ${EOL_THRESHOLD}%，建议安排更换或退役评估`
+    }
+  }
+  const remainingYears = (soh - EOL_THRESHOLD) / ANNUAL_DEGRADATION
+  const eolDate = dayjs().add(remainingYears, 'year')
+  const level = remainingYears < 2 ? 'err' : remainingYears < 5 ? 'warn' : 'ok'
+  return {
+    soh, threshold: EOL_THRESHOLD,
+    degRate: ANNUAL_DEGRADATION,
+    remainingYears: +remainingYears.toFixed(1),
+    eolDate: eolDate.format('YYYY-MM'),
+    level,
+    hint: level === 'err'
+      ? '剩余寿命较短，建议纳入近期续保重点评估'
+      : level === 'warn'
+        ? '寿命衰减进入中期，需关注循环深度'
+        : '健康度良好，寿命充裕'
+  }
+})
+
+/* ---------- 保单关联面板 ---------- */
+const policyMeta = computed(() => {
+  const info = props.detail.info
+  if (props.detail.type !== 'station' || !info) return null
+  const start = dayjs(info.onlineDate)
+  const end = start.add(1, 'year')
+  const now = dayjs()
+  const days = end.diff(now, 'day')
+  return {
+    no: info.insurancePolicy,
+    status: info.insuranceStatus,
+    start: start.format('YYYY-MM-DD'),
+    end: end.format('YYYY-MM-DD'),
+    days,
+    daysClass: days < 0 ? 'err' : days < 30 ? 'warn' : days < 90 ? 'mid' : 'ok',
+    daysLabel: days < 0 ? `已过期 ${-days} 天` : `剩余 ${days} 天`,
+    coverage: info.coverage,
+    annualPremium: info.annualPremium,
+    alarmCount30d: info.alarmCount30d,
+    severeAlarm30d: info.severeAlarm30d,
+    inspectionRate: info.inspectionRate,
+    rectifyRate: info.rectifyRate
+  }
+})
 
 function exportTrendCSV() {
   const { labels, series } = genSeries(histRange.value, props.detail.type)
@@ -327,6 +416,49 @@ onBeforeUnmount(() => {
         </template>
         <div class="tp">
           <template v-if="detail.type === 'station'">
+            <div class="policy-card" v-if="policyMeta">
+              <div class="pc-head">
+                <div class="pc-title">
+                  <el-icon style="color:#015eea"><Lock /></el-icon>
+                  保单与承保信息
+                </div>
+                <el-tag :type="policyMeta.status === '已承保' ? 'success' : policyMeta.status === '待续保' ? 'warning' : 'info'" size="small">{{ policyMeta.status }}</el-tag>
+              </div>
+              <div class="pc-grid">
+                <div class="pc-cell">
+                  <div class="pc-l">保单编号</div>
+                  <div class="pc-v mono">{{ policyMeta.no }}</div>
+                </div>
+                <div class="pc-cell">
+                  <div class="pc-l">承保期间</div>
+                  <div class="pc-v">{{ policyMeta.start }} → {{ policyMeta.end }}</div>
+                </div>
+                <div class="pc-cell">
+                  <div class="pc-l">剩余天数</div>
+                  <div class="pc-v" :class="policyMeta.daysClass">{{ policyMeta.daysLabel }}</div>
+                </div>
+                <div class="pc-cell">
+                  <div class="pc-l">承保金额</div>
+                  <div class="pc-v">{{ policyMeta.coverage }}</div>
+                </div>
+                <div class="pc-cell">
+                  <div class="pc-l">年保费</div>
+                  <div class="pc-v">{{ policyMeta.annualPremium }}</div>
+                </div>
+                <div class="pc-cell">
+                  <div class="pc-l">30 天告警</div>
+                  <div class="pc-v">{{ policyMeta.alarmCount30d }} 次<span v-if="policyMeta.severeAlarm30d > 0" class="severe">含严重 {{ policyMeta.severeAlarm30d }}</span></div>
+                </div>
+                <div class="pc-cell">
+                  <div class="pc-l">巡检合格率</div>
+                  <div class="pc-v ok">{{ policyMeta.inspectionRate }}%</div>
+                </div>
+                <div class="pc-cell">
+                  <div class="pc-l">隐患整改率</div>
+                  <div class="pc-v">{{ policyMeta.rectifyRate }}%</div>
+                </div>
+              </div>
+            </div>
             <el-descriptions :column="3" border size="default" class="desc">
               <el-descriptions-item label="站点编号">{{ detail.info.id }}</el-descriptions-item>
               <el-descriptions-item label="所在位置">{{ detail.info.location }}</el-descriptions-item>
@@ -337,7 +469,7 @@ onBeforeUnmount(() => {
               <el-descriptions-item label="舱 / 簇 / PACK">{{ detail.info.cabins }} / {{ detail.info.clusters }} / {{ detail.info.packs }}</el-descriptions-item>
               <el-descriptions-item label="平均 SOH">{{ detail.info.soh }} %</el-descriptions-item>
               <el-descriptions-item label="风险评分">
-                <el-tag :type="detail.info.riskScore >= 90 ? 'success' : detail.info.riskScore >= 75 ? '' : 'warning'" size="small">{{ detail.info.riskScore }} 分</el-tag>
+                <el-tag :type="detail.info.riskScore >= 90 ? 'success' : detail.info.riskScore >= 75 ? 'primary' : 'warning'" size="small">{{ detail.info.riskScore }} 分</el-tag>
               </el-descriptions-item>
               <el-descriptions-item label="保单编号">{{ detail.info.insurancePolicy }}</el-descriptions-item>
               <el-descriptions-item label="保险状态">{{ detail.info.insuranceStatus }}</el-descriptions-item>
@@ -384,6 +516,28 @@ onBeforeUnmount(() => {
           </template>
 
           <template v-if="detail.type === 'pack'">
+            <div class="life-card" v-if="lifePrediction" :class="lifePrediction.level">
+              <div class="lc-head">
+                <div class="lc-title">
+                  <el-icon><DataLine /></el-icon>
+                  剩余寿命预测
+                </div>
+                <div class="lc-tag" :class="lifePrediction.level">
+                  {{ lifePrediction.level === 'err' ? '⚠ 临近 EOL' : lifePrediction.level === 'warn' ? '关注' : '健康' }}
+                </div>
+              </div>
+              <div class="lc-body">
+                <div class="lc-main">
+                  <div class="lc-num">{{ lifePrediction.remainingYears }}</div>
+                  <div class="lc-unit">年</div>
+                </div>
+                <div class="lc-sub">
+                  <div>当前 SOH <b>{{ lifePrediction.soh }}%</b> · 年衰减按 {{ lifePrediction.degRate }}% 估算</div>
+                  <div>预计达 {{ lifePrediction.threshold }}% (EOL)：<b>{{ lifePrediction.eolDate }}</b></div>
+                  <div class="lc-hint">{{ lifePrediction.hint }}</div>
+                </div>
+              </div>
+            </div>
             <el-descriptions :column="3" border class="desc">
               <el-descriptions-item label="PACK 电压">{{ detail.info.voltage }} V</el-descriptions-item>
               <el-descriptions-item label="PACK 电流">{{ detail.info.current }} A</el-descriptions-item>
@@ -467,14 +621,27 @@ onBeforeUnmount(() => {
         </template>
         <div class="tp">
           <div class="pl-head">
-            <el-input v-model="packSearch" placeholder="搜索 PACK 编号/层级" clearable size="default" style="width:240px" />
+            <el-input v-model="packSearch" placeholder="搜索 PACK 编号/层级" clearable size="default" style="width:220px" />
             <el-radio-group v-model="packFilter" size="small">
               <el-radio-button value="">全部</el-radio-button>
               <el-radio-button value="ok">正常</el-radio-button>
               <el-radio-button value="warn">警示</el-radio-button>
               <el-radio-button value="err">异常</el-radio-button>
             </el-radio-group>
+            <el-checkbox v-model="onlyFav" size="default">
+              <el-icon style="color:#f59e0b;vertical-align:-2px"><StarFilled /></el-icon>
+              仅看关注 ({{ prefStore.favoriteCount }})
+            </el-checkbox>
             <div class="pl-spacer" />
+            <el-button
+              v-if="compareSelection.length > 0"
+              size="default"
+              type="primary"
+              plain
+              :icon="DataLine"
+              :disabled="compareSelection.length < 2 || compareSelection.length > 4"
+              @click="openCompare"
+            >对比 ({{ compareSelection.length }})</el-button>
             <el-button size="default" :icon="Document" @click="exportPacks">导出 CSV ({{ filteredPacks.length }})</el-button>
           </div>
           <el-table
@@ -484,7 +651,22 @@ onBeforeUnmount(() => {
             max-height="520"
             :row-class-name="rowClass"
             :default-sort="{ prop: 'temperatureMax', order: 'descending' }"
+            row-key="id"
+            @selection-change="handleSelectionChange"
           >
+            <el-table-column type="selection" width="42" :selectable="(row) => compareSelection.length < 4 || compareSelection.some(r => r.id === row.id)" />
+            <el-table-column label="" width="44" align="center">
+              <template #default="{ row }">
+                <el-icon
+                  class="fav-toggle"
+                  :class="{ on: prefStore.isFavorite(row.id) }"
+                  @click.stop="prefStore.toggleFavorite(row.id)"
+                >
+                  <StarFilled v-if="prefStore.isFavorite(row.id)" />
+                  <Star v-else />
+                </el-icon>
+              </template>
+            </el-table-column>
             <el-table-column label="健康度" width="80">
               <template #default="{ row }">
                 <span class="pl-pill" :class="packHealth(row)">
@@ -547,6 +729,8 @@ onBeforeUnmount(() => {
         </div>
       </el-tab-pane>
     </el-tabs>
+
+    <PackCompareDialog v-model="compareDialog" :packs="compareSelection" />
   </div>
 </template>
 
@@ -661,9 +845,75 @@ onBeforeUnmount(() => {
 .neg { color: #06b6d4; }
 .warn { color: #f59e0b; }
 .err { color: #ef4444; }
+/* === 剩余寿命卡片 === */
+.life-card {
+  border-radius: $radius;
+  padding: 16px 20px;
+  margin-bottom: 18px;
+  border: 1px solid rgba(34,211,160,0.25);
+  background: linear-gradient(135deg, rgba(34,211,160,0.08) 0%, #fff 70%);
+  border-left: 4px solid #22d3a0;
+  &.warn { border-color: rgba(245,158,11,0.3); background: linear-gradient(135deg, rgba(245,158,11,0.08) 0%, #fff 70%); border-left-color: #f59e0b; }
+  &.err  { border-color: rgba(239,68,68,0.3); background: linear-gradient(135deg, rgba(239,68,68,0.08) 0%, #fff 70%); border-left-color: #ef4444; }
+}
+.lc-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.lc-title { font-size: 14px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px;
+  .el-icon { color: #22d3a0; }
+  .life-card.warn & .el-icon { color: #f59e0b; }
+  .life-card.err & .el-icon { color: #ef4444; }
+}
+.lc-tag { font-size: 11px; padding: 2px 8px; border-radius: 10px; font-weight: 500;
+  &.ok { color: #22d3a0; background: rgba(34,211,160,0.12); }
+  &.warn { color: #f59e0b; background: rgba(245,158,11,0.14); }
+  &.err { color: #ef4444; background: rgba(239,68,68,0.12); }
+}
+.lc-body { display: grid; grid-template-columns: 140px 1fr; gap: 24px; align-items: center; }
+.lc-main { display: flex; align-items: baseline; gap: 6px; }
+.lc-num { font-family: $font-num; font-size: 42px; font-weight: 700; line-height: 1; color: #015eea;
+  .life-card.warn & { color: #f59e0b; }
+  .life-card.err & { color: #ef4444; }
+}
+.lc-unit { font-size: 14px; color: $text-muted; }
+.lc-sub { font-size: 12px; color: $text-secondary; line-height: 1.7;
+  b { color: $text-primary; font-family: $font-num; }
+}
+.lc-hint { color: $text-muted; margin-top: 4px; }
+
+/* === 保单面板 === */
+.policy-card {
+  background: linear-gradient(135deg, #f0f6ff 0%, #ffffff 60%);
+  border: 1px solid rgba(1,94,234,0.18);
+  border-left: 4px solid #015eea;
+  border-radius: $radius;
+  padding: 16px 20px;
+  margin-bottom: 18px;
+}
+.pc-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+.pc-title { font-size: 14px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
+.pc-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px 24px;
+}
+.pc-cell { display: flex; flex-direction: column; gap: 4px; }
+.pc-l { font-size: 11px; color: $text-muted; }
+.pc-v { font-size: 14px; font-weight: 500; color: $text-primary;
+  &.mono { font-family: $font-num; letter-spacing: 0.3px; }
+  &.ok { color: #22d3a0; }
+  &.warn { color: #f59e0b; }
+  &.mid { color: #015eea; }
+  &.err { color: #ef4444; }
+  .severe { margin-left: 8px; padding: 1px 6px; font-size: 11px; background: rgba(239,68,68,0.12); color: #ef4444; border-radius: 4px; }
+}
+.fav-toggle {
+  cursor: pointer; font-size: 16px; color: #c4cad8;
+  transition: color 0.15s, transform 0.15s;
+  &:hover { color: #f59e0b; transform: scale(1.15); }
+  &.on { color: #f59e0b; }
+}
 
 @media (max-width: 1100px) {
   .trend-summary, .dist-kpis { grid-template-columns: repeat(2, 1fr); }
   .pl-head { flex-wrap: wrap; }
+  .pc-grid { grid-template-columns: repeat(2, 1fr); }
+  .lc-body { grid-template-columns: 1fr; }
 }
 </style>
