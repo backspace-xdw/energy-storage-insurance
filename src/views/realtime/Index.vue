@@ -1,13 +1,17 @@
 <script setup>
 import { onMounted, onBeforeUnmount, ref, reactive, computed, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import dayjs from 'dayjs'
 import echarts from '@/utils/echarts'
 import PageHeader from '@/components/PageHeader.vue'
 import { stations } from '@/mock/data'
 import {
   VideoCamera, Refresh, FullScreen, Connection, Loading, Lightning,
-  Sunny, Aim, Setting, CircleCheckFilled
+  Sunny, Aim, Setting, CircleCheckFilled, Document, Warning, Search
 } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+
+const router = useRouter()
 
 /* ---------- 选择器 ---------- */
 const stationId = ref(stations[0].id)
@@ -124,6 +128,15 @@ function initCharts() {
   heatChart = echarts.init(heatEl.value)
   histChart = echarts.init(histEl.value)
   renderAll()
+  // 单体电压条形图点击钻取
+  cellChart.on('click', (p) => {
+    const sorted = [...cells].sort((a, b) => a.voltage - b.voltage)
+    const c = sorted[p.dataIndex]
+    if (c) {
+      const orig = cells.find(x => x.id === c.id)
+      if (orig) { cellDetail.value = orig; cellDrawer.value = true }
+    }
+  })
 }
 
 function renderTrend() {
@@ -292,9 +305,11 @@ function tick() {
     tempGrid[i] = +Math.max(26, Math.min(38, tempGrid[i] + (Math.random() - 0.5) * 0.3)).toFixed(1)
   }
 
-  // 报文流：每 tick 推 2-4 条
-  const n = 2 + Math.floor(Math.random() * 3)
-  for (let i = 0; i < n; i++) pushMessage()
+  // 报文流：每 tick 推 2-4 条 (msgPaused 时不推)
+  if (!msgPaused.value) {
+    const n = 2 + Math.floor(Math.random() * 3)
+    for (let i = 0; i < n; i++) pushMessage()
+  }
 
   // 接口 latency 微抖
   ifaces.forEach(f => {
@@ -345,6 +360,62 @@ function fullscreen() {
   if (!document.fullscreenElement) el.requestFullscreen?.()
   else document.exitFullscreen?.()
 }
+
+/* ---------- 报文流详情 + 过滤 + 导出 ---------- */
+const msgFilterProto = ref('')
+const msgPaused = ref(false)
+const msgDetail = ref(null)
+const msgDrawer = ref(false)
+const filteredMessages = computed(() =>
+  messages.value.filter(m => !msgFilterProto.value || m.proto === msgFilterProto.value).slice(0, 14)
+)
+const protoStats = computed(() => {
+  const stats = {}
+  messages.value.forEach(m => { stats[m.proto] = (stats[m.proto] || 0) + 1 })
+  return stats
+})
+function openMsgDetail(m) {
+  msgDetail.value = m
+  msgDrawer.value = true
+}
+function exportMessages() {
+  const header = ['time', 'proto', 'id', 'name', 'data', 'size']
+  const csv = [header.join(',')]
+  messages.value.forEach(m => {
+    csv.push(header.map(f => {
+      const v = m[f]; const s = v == null ? '' : String(v).replace(/"/g, '""')
+      return /[,"\n]/.test(s) ? `"${s}"` : s
+    }).join(','))
+  })
+  const blob = new Blob(['﻿' + csv.join('\n')], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url; a.download = `BMS-报文-${dayjs().format('YYYYMMDD-HHmmss')}.csv`; a.click()
+  URL.revokeObjectURL(url)
+  ElMessage.success(`已导出 ${messages.value.length} 条报文`)
+}
+
+/* ---------- 电芯点击钻取 ---------- */
+const cellDetail = ref(null)
+const cellDrawer = ref(false)
+function openCellDetail(idx) {
+  const c = cells[idx]
+  if (!c) return
+  cellDetail.value = c
+  cellDrawer.value = true
+}
+
+/* ---------- KPI 阈值告警 ---------- */
+const kpiAlerts = computed(() => {
+  const list = []
+  if (kpi.temperatureMax > 35) list.push({ key: 'temp', level: 'warn', msg: `最高温 ${kpi.temperatureMax.toFixed(1)}℃ 接近告警阈值 38℃` })
+  if (kpi.temperatureMax > 38) list.push({ key: 'temp', level: 'err', msg: `最高温 ${kpi.temperatureMax.toFixed(1)}℃ 已超阈值！` })
+  if (kpi.voltageDelta > 50) list.push({ key: 'vd', level: 'warn', msg: `单体压差 ${kpi.voltageDelta} mV > 50 mV 阈值` })
+  if (kpi.voltageDelta > 80) list.push({ key: 'vd', level: 'err', msg: `单体压差 ${kpi.voltageDelta} mV 严重超阈！` })
+  if (kpi.insulation < 500) list.push({ key: 'ins', level: 'err', msg: `绝缘电阻 ${kpi.insulation} kΩ 低于安全线 500 kΩ` })
+  return list
+})
+
 </script>
 
 <template>
@@ -394,6 +465,24 @@ function fullscreen() {
       </div>
     </div>
 
+    <!-- KPI 阈值告警条 -->
+    <transition-group name="alert-fade" tag="div" class="kpi-alerts" v-if="kpiAlerts.length">
+      <el-alert
+        v-for="a in kpiAlerts" :key="a.key + a.level"
+        :type="a.level === 'err' ? 'error' : 'warning'"
+        :title="a.msg"
+        show-icon
+        :closable="false"
+      >
+        <template #default>
+          <span>{{ a.msg }}</span>
+          <el-button text type="primary" size="small" @click="router.push('/app/rules')" style="margin-left:8px">
+            查看规则
+          </el-button>
+        </template>
+      </el-alert>
+    </transition-group>
+
     <!-- KPI -->
     <div class="kpi-grid">
       <div class="kpi-cell kpi-soc">
@@ -440,10 +529,27 @@ function fullscreen() {
       <div class="card msg">
         <div class="card-head">
           <div class="ch-title"><el-icon><Connection /></el-icon> BMS 报文流</div>
-          <el-tag size="small" type="success" effect="light">{{ messages.length }} 帧/s</el-tag>
+          <div class="msg-tools">
+            <el-button
+              size="small" text
+              :type="msgPaused ? 'primary' : 'danger'"
+              @click="msgPaused = !msgPaused"
+            >{{ msgPaused ? '继续' : '暂停' }}</el-button>
+            <el-button size="small" text type="primary" :icon="Document" @click="exportMessages">导出</el-button>
+          </div>
+        </div>
+        <div class="msg-filter">
+          <el-radio-group v-model="msgFilterProto" size="small">
+            <el-radio-button value="">全部 {{ messages.length }}</el-radio-button>
+            <el-radio-button v-for="(c, p) in protoStats" :key="p" :value="p">{{ p }} {{ c }}</el-radio-button>
+          </el-radio-group>
         </div>
         <div class="msg-list">
-          <div class="msg-item" v-for="(m, i) in messages.slice(0, 10)" :key="i" :class="{ fresh: i === 0 }">
+          <div
+            class="msg-item" v-for="(m, i) in filteredMessages" :key="m.time + i"
+            :class="{ fresh: i === 0 }"
+            @click="openMsgDetail(m)"
+          >
             <div class="mi-row">
               <span class="mi-time">{{ m.time }}</span>
               <span class="mi-proto" :class="m.proto.toLowerCase().replace(/[^a-z]/g,'')">{{ m.proto }}</span>
@@ -452,6 +558,7 @@ function fullscreen() {
             </div>
             <div class="mi-data">{{ m.data }}</div>
           </div>
+          <div v-if="!filteredMessages.length" class="msg-empty">无该协议报文</div>
         </div>
       </div>
     </div>
@@ -478,6 +585,58 @@ function fullscreen() {
         <div class="chart h220" ref="heatEl" />
       </div>
     </div>
+
+    <!-- 报文详情 drawer -->
+    <el-drawer v-model="msgDrawer" :title="`报文详情 - ${msgDetail?.id || ''}`" size="460" direction="rtl">
+      <template v-if="msgDetail">
+        <div class="md-grid">
+          <div><div class="md-l">时间</div><div class="md-v mono">{{ msgDetail.time }}</div></div>
+          <div><div class="md-l">协议</div><el-tag size="small" effect="plain">{{ msgDetail.proto }}</el-tag></div>
+          <div><div class="md-l">报文 ID</div><div class="md-v mono">{{ msgDetail.id }}</div></div>
+          <div><div class="md-l">报文名称</div><div class="md-v">{{ msgDetail.name }}</div></div>
+          <div><div class="md-l">长度</div><div class="md-v">{{ msgDetail.size }} 字节</div></div>
+        </div>
+        <div class="md-section">
+          <div class="md-l">原始数据 (HEX)</div>
+          <pre class="md-payload">{{ msgDetail.data }}</pre>
+        </div>
+        <div class="md-section">
+          <div class="md-l">字段解析（示例）</div>
+          <table class="md-fields">
+            <tr><th>字节</th><th>字段</th><th>值</th></tr>
+            <tr><td>0-1</td><td>电压</td><td>{{ kpi.voltage }} V</td></tr>
+            <tr><td>2-3</td><td>电流</td><td>{{ kpi.current }} A</td></tr>
+            <tr><td>4</td><td>SOC</td><td>{{ kpi.soc.toFixed(0) }} %</td></tr>
+            <tr><td>5</td><td>最高温</td><td>{{ kpi.temperatureMax.toFixed(1) }} ℃</td></tr>
+            <tr><td>6-7</td><td>状态字</td><td><code class="mono">0x{{ msgDetail.data.split(' ').slice(6, 8).join('') }}</code></td></tr>
+          </table>
+        </div>
+      </template>
+    </el-drawer>
+
+    <!-- 电芯详情 drawer -->
+    <el-drawer v-model="cellDrawer" :title="`电芯 #${cellDetail?.id || ''} 详情`" size="400" direction="rtl">
+      <template v-if="cellDetail">
+        <div class="cd-num">
+          <span>{{ cellDetail.voltage.toFixed(3) }}</span><small>V</small>
+        </div>
+        <div class="cd-grid">
+          <div><div class="md-l">温度</div><div class="md-v">{{ cellDetail.temperature.toFixed(1) }} ℃</div></div>
+          <div><div class="md-l">偏离均值</div><div class="md-v">{{ ((cellDetail.voltage - cells.reduce((s,c)=>s+c.voltage,0)/cells.length) * 1000).toFixed(0) }} mV</div></div>
+          <div><div class="md-l">所在 PACK</div><div class="md-v">PACK-{{ String(packNo).padStart(2,'0') }}</div></div>
+          <div><div class="md-l">所在位置</div><div class="md-v">{{ Math.floor((cellDetail.id - 1) / 26) + 1 }} 排 {{ ((cellDetail.id - 1) % 26) + 1 }} 节</div></div>
+          <div><div class="md-l">健康度</div><div class="md-v">{{ (97 + Math.random() * 2).toFixed(1) }} %</div></div>
+          <div><div class="md-l">累计循环</div><div class="md-v">{{ kpi.cycleCount }} 次</div></div>
+        </div>
+        <el-alert
+          v-if="cellDetail.voltage < 3.31"
+          type="warning"
+          title="该单体电压偏低，建议关注一致性"
+          show-icon :closable="false"
+          style="margin-top:14px"
+        />
+      </template>
+    </el-drawer>
 
     <!-- 行 3: 单体分布直方图 + 接口接入状态 -->
     <div class="row">
@@ -641,6 +800,42 @@ function fullscreen() {
   &.ok { color: #22d3a0; }
   &.warn { color: #f59e0b; }
 }
+
+/* === KPI 阈值告警条 === */
+.kpi-alerts { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.alert-fade-enter-active, .alert-fade-leave-active { transition: opacity 0.3s, transform 0.3s; }
+.alert-fade-enter-from, .alert-fade-leave-to { opacity: 0; transform: translateY(-6px); }
+
+/* === 报文流过滤/操作 === */
+.msg-tools { display: flex; gap: 4px; }
+.msg-filter { padding: 0 4px 10px; overflow-x: auto;
+  :deep(.el-radio-group) { white-space: nowrap; }
+}
+.msg-item { cursor: pointer; }
+.msg-empty { padding: 24px; text-align: center; color: #8a93a8; font-size: 12px; }
+
+/* === 报文详情 drawer === */
+.md-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 18px; margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid #e7eaf3; }
+.md-l { font-size: 11px; color: #8a93a8; }
+.md-v { font-size: 13px; font-weight: 500; margin-top: 2px; }
+.mono { font-family: monospace; }
+.md-section { margin-bottom: 18px; }
+.md-payload { background: #10152e; color: #b3c5ff;
+  padding: 10px 14px; border-radius: 6px;
+  font-family: 'JetBrains Mono', Menlo, monospace; font-size: 12px; line-height: 1.7;
+  margin: 6px 0 0; overflow-x: auto;
+}
+.md-fields { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px;
+  th, td { padding: 6px 10px; border-bottom: 1px solid #eef0f7; text-align: left; }
+  th { color: #8a93a8; font-weight: 500; background: #f5f7fb; }
+}
+
+/* === 电芯详情 drawer === */
+.cd-num { text-align: center; padding: 24px 0; border-bottom: 1px solid #e7eaf3;
+  span { font-size: 48px; font-weight: 600; color: #015eea; font-family: tabular-nums; }
+  small { font-size: 16px; color: #8a93a8; margin-left: 6px; }
+}
+.cd-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 18px; margin-top: 16px; }
 
 @media (max-width: 1400px) {
   .kpi-grid { grid-template-columns: repeat(3, 1fr); }
