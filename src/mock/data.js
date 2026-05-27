@@ -185,10 +185,16 @@ export const renewals = stations.slice(0, 5).map((s, i) => {
   }
 })
 
+// 事故类型决定曲线模板：thermal/insulation/fire
 export const incidents = [
-  { id: 'INC-2026-007', stationName: '常熟新材料园储能站', location: '2#舱 / 3#簇 / PACK-07', type: '电芯热失控预警', time: '2026-03-12 14:23:18', severity: '高', duration: '47 min', status: '已结案', loss: '0（成功阻断）', root: 'PACK-07 电芯一致性差 + 温度梯度异常' },
-  { id: 'INC-2026-005', stationName: '昆山光储一体站', location: '1#舱 / 2#簇', type: '绝缘下降', time: '2026-02-28 09:11:02', severity: '中', duration: '1.5 h', status: '已结案', loss: '设备级', root: '簇内高压连接器受潮' },
-  { id: 'INC-2026-003', stationName: '苏州工业园储能电站', location: '3#舱', type: '消防误动作', time: '2026-01-19 22:44:30', severity: '低', duration: '15 min', status: '已结案', loss: '0', root: '探测器灵敏度参数偏低' }
+  { id: 'INC-2026-007', stationName: '常熟新材料园储能站', location: '2#舱 / 3#簇 / PACK-07', type: '电芯热失控预警', templateKey: 'thermal', time: '2026-03-12 14:23:18', severity: '高', duration: '47 min', status: '已结案', loss: '0（成功阻断）', root: 'PACK-07 电芯一致性差 + 温度梯度异常' },
+  { id: 'INC-2026-006', stationName: '徐州矿区储能调峰站', location: '4#舱 / 1#簇 / PACK-12', type: '电芯热失控预警', templateKey: 'thermal', time: '2026-03-05 18:42:11', severity: '高', duration: '52 min', status: '已溯源', loss: 'PACK 损毁', root: '充电倍率超限引发析锂' },
+  { id: 'INC-2026-005', stationName: '昆山光储一体站', location: '1#舱 / 2#簇', type: '绝缘下降', templateKey: 'insulation', time: '2026-02-28 09:11:02', severity: '中', duration: '1.5 h', status: '已结案', loss: '设备级', root: '簇内高压连接器受潮' },
+  { id: 'INC-2026-004', stationName: '无锡惠山工商储项目', location: '2#舱 / 3#簇', type: '绝缘下降', templateKey: 'insulation', time: '2026-02-14 03:28:55', severity: '中', duration: '2 h 10 min', status: '理赔中', loss: '簇级', root: '舱内冷凝水进入接线端子' },
+  { id: 'INC-2026-003', stationName: '苏州工业园储能电站', location: '3#舱', type: '消防误动作', templateKey: 'fire', time: '2026-01-19 22:44:30', severity: '低', duration: '15 min', status: '已结案', loss: '0', root: '探测器灵敏度参数偏低' },
+  { id: 'INC-2026-002', stationName: '南通滨海风储一体站', location: '1#舱', type: '消防误动作', templateKey: 'fire', time: '2026-01-08 11:35:20', severity: '低', duration: '22 min', status: '溯源中', loss: '0', root: '待确认（疑似传感器故障）' },
+  { id: 'INC-2025-049', stationName: '苏州工业园储能电站', location: '2#舱 / 4#簇 / PACK-03', type: '电芯热失控预警', templateKey: 'thermal', time: '2025-12-22 20:18:09', severity: '高', duration: '38 min', status: '已结案', loss: '0', root: 'BMS 误报，电芯实际状态正常' },
+  { id: 'INC-2025-046', stationName: '常熟新材料园储能站', location: '5#舱 / 1#簇', type: '绝缘下降', templateKey: 'insulation', time: '2025-11-30 06:52:44', severity: '中', duration: '1 h 12 min', status: '已理赔', loss: '设备级 (赔付 8.2 万)', root: '连接器装配工艺缺陷' }
 ]
 
 export const dashboardKpis = {
