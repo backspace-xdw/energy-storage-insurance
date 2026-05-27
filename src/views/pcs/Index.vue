@@ -1,12 +1,14 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
+import dayjs from 'dayjs'
 import echarts from '@/utils/echarts'
 import PageHeader from '@/components/PageHeader.vue'
 import { stations } from '@/mock/data'
 import {
   Lightning, TrendCharts, Refresh, Setting, Aim,
-  CircleCheckFilled, Warning, Switch
+  CircleCheckFilled, Warning, Switch, VideoCamera, Loading, Check
 } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 
 const stationId = ref(stations[0].id)
 const pcsId = ref('PCS-01')
@@ -254,6 +256,76 @@ const dayStats = computed(() => {
     eff: avgEff.toFixed(2)
   }
 })
+
+/* ---------- 实时告警条 ---------- */
+const pcsAlerts = computed(() => {
+  const list = []
+  if (pcs.igbtTempA > 70 || pcs.igbtTempB > 70 || pcs.igbtTempC > 70) {
+    list.push({ key: 'igbt', level: 'err', msg: `IGBT 温度超阈值 70℃ (A:${pcs.igbtTempA.toFixed(1)} B:${pcs.igbtTempB.toFixed(1)} C:${pcs.igbtTempC.toFixed(1)})` })
+  } else if (pcs.igbtTempA > 60 || pcs.igbtTempB > 60 || pcs.igbtTempC > 60) {
+    list.push({ key: 'igbt', level: 'warn', msg: `IGBT 温度偏高 (最高 ${Math.max(pcs.igbtTempA, pcs.igbtTempB, pcs.igbtTempC).toFixed(1)}℃)` })
+  }
+  if (pcs.thdU > 3) list.push({ key: 'thdu', level: 'warn', msg: `电压谐波 THDu ${pcs.thdU}% > 3% 阈值` })
+  if (pcs.thdI > 5) list.push({ key: 'thdi', level: 'warn', msg: `电流谐波 THDi ${pcs.thdI}% > 5% 阈值` })
+  if (pcs.efficiency < 95) list.push({ key: 'eff', level: 'warn', msg: `转换效率 ${pcs.efficiency}% 低于 95%` })
+  if (Math.abs(pcs.freq - 50) > 0.5) list.push({ key: 'freq', level: 'err', msg: `频率 ${pcs.freq} Hz 偏差超阈值` })
+  return list
+})
+
+/* ---------- 暂停采集 ---------- */
+const paused = ref(false)
+function togglePause() {
+  paused.value = !paused.value
+  if (paused.value) {
+    if (timer) { clearInterval(timer); timer = null }
+    ElMessage.success('已暂停采集')
+  } else {
+    timer = setInterval(tick, 500)
+    ElMessage.success('已继续采集')
+  }
+}
+
+/* ---------- PCS 配置 dialog ---------- */
+const configDialog = ref(false)
+const config = reactive({
+  ratedPower: 250,
+  igbtAlarmTemp: 70,
+  thdULimit: 3,
+  thdILimit: 5,
+  effLowerLimit: 95,
+  workMode: '自动并网'
+})
+function openConfig() { configDialog.value = true }
+function saveConfig() {
+  configDialog.value = false
+  ElMessage.success(`PCS 配置已保存：额定 ${config.ratedPower}kW · ${config.workMode}`)
+}
+
+/* ---------- 导出能量报告 ---------- */
+function exportEnergyReport() {
+  const r = {
+    reportId: 'PE-' + pcsId.value + '-' + dayjs().format('YYYYMMDD-HHmm'),
+    generatedAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+    pcs: { id: pcsId.value, station: stations.find(s => s.id === stationId.value)?.name, state: curState.value.label },
+    rated: { power_kW: config.ratedPower, workMode: config.workMode },
+    realtime: { ...pcs },
+    daily: {
+      chargeKWh: +dayStats.value.charge,
+      dischargeKWh: +dayStats.value.discharge,
+      cycleKWh: +dayStats.value.cycle,
+      avgEfficiency: +dayStats.value.eff
+    },
+    powerCurve: day.power.map((p, i) => ({ time: day.labels[i], power_kW: p })),
+    efficiencyCurve: day.efficiency.map((e, i) => ({ time: day.labels[i], efficiency: e })),
+    alerts: pcsAlerts.value
+  }
+  const blob = new Blob([JSON.stringify(r, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url; a.download = `PCS-能量报告-${pcsId.value}-${dayjs().format('YYYYMMDD-HHmm')}.json`; a.click()
+  URL.revokeObjectURL(url)
+  ElMessage.success(`已导出 ${pcsId.value} 能量报告`)
+}
 </script>
 
 <template>
@@ -264,8 +336,14 @@ const dayStats = computed(() => {
       desc="三相交直流波形 · 功率与谐波 · IGBT 温升 · 24h 充放电曲线"
     >
       <template #actions>
-        <el-button :icon="Setting">PCS 配置</el-button>
-        <el-button type="primary" :icon="TrendCharts">导出能量报告</el-button>
+        <el-button
+          :icon="paused ? VideoCamera : Loading"
+          :type="paused ? 'primary' : 'danger'"
+          plain
+          @click="togglePause"
+        >{{ paused ? '继续采集' : '暂停采集' }}</el-button>
+        <el-button :icon="Setting" @click="openConfig">PCS 配置</el-button>
+        <el-button type="primary" :icon="TrendCharts" @click="exportEnergyReport">导出能量报告</el-button>
       </template>
     </PageHeader>
 
@@ -284,9 +362,20 @@ const dayStats = computed(() => {
       </div>
       <div class="bar-right">
         <el-icon class="pulse"><Lightning /></el-icon>
-        额定容量 <b>250 kW</b> · 当前 <b>{{ Math.abs(pcs.P).toFixed(1) }} kW</b>
+        额定容量 <b>{{ config.ratedPower }} kW</b> · 当前 <b>{{ Math.abs(pcs.P).toFixed(1) }} kW</b>
+        · 负载 <b>{{ (Math.abs(pcs.P) / config.ratedPower * 100).toFixed(0) }}%</b>
       </div>
     </div>
+
+    <!-- 实时告警条 -->
+    <transition-group name="alert-fade" tag="div" class="pcs-alerts" v-if="pcsAlerts.length">
+      <el-alert
+        v-for="a in pcsAlerts" :key="a.key + a.level"
+        :type="a.level === 'err' ? 'error' : 'warning'"
+        :title="a.msg"
+        show-icon :closable="false"
+      />
+    </transition-group>
 
     <!-- 行 1: 直流侧 + 交流侧 + 关键 -->
     <div class="kpi-grid">
@@ -407,11 +496,53 @@ const dayStats = computed(() => {
         </div>
       </div>
     </div>
+
+    <!-- PCS 配置 dialog -->
+    <el-dialog v-model="configDialog" title="PCS 配置" width="520">
+      <el-form label-width="110px" label-position="left">
+        <el-form-item label="额定功率">
+          <el-input-number v-model="config.ratedPower" :min="50" :max="1000" :step="10" controls-position="right" />
+          <span style="margin-left:6px;color:#8a93a8">kW</span>
+        </el-form-item>
+        <el-form-item label="工作模式">
+          <el-select v-model="config.workMode" style="width:100%">
+            <el-option label="自动并网" value="自动并网" />
+            <el-option label="手动并网" value="手动并网" />
+            <el-option label="孤岛模式" value="孤岛模式" />
+            <el-option label="维护模式" value="维护模式" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="IGBT 告警温度">
+          <el-input-number v-model="config.igbtAlarmTemp" :min="50" :max="100" :step="1" controls-position="right" />
+          <span style="margin-left:6px;color:#8a93a8">℃</span>
+        </el-form-item>
+        <el-form-item label="电压谐波上限">
+          <el-input-number v-model="config.thdULimit" :min="1" :max="10" :step="0.5" :precision="1" controls-position="right" />
+          <span style="margin-left:6px;color:#8a93a8">%</span>
+        </el-form-item>
+        <el-form-item label="电流谐波上限">
+          <el-input-number v-model="config.thdILimit" :min="1" :max="15" :step="0.5" :precision="1" controls-position="right" />
+          <span style="margin-left:6px;color:#8a93a8">%</span>
+        </el-form-item>
+        <el-form-item label="效率下限">
+          <el-input-number v-model="config.effLowerLimit" :min="80" :max="99" :step="0.5" :precision="1" controls-position="right" />
+          <span style="margin-left:6px;color:#8a93a8">%</span>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="configDialog = false">取消</el-button>
+        <el-button type="primary" :icon="Check" @click="saveConfig">保存配置</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
 <style lang="scss" scoped>
 @use '@/styles/variables.scss' as *;
+
+.pcs-alerts { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+.alert-fade-enter-active, .alert-fade-leave-active { transition: opacity 0.3s, transform 0.3s; }
+.alert-fade-enter-from, .alert-fade-leave-to { opacity: 0; transform: translateY(-6px); }
 
 .pcs { padding-bottom: 24px; }
 
