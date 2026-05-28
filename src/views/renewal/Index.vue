@@ -4,9 +4,11 @@ import dayjs from 'dayjs'
 import PageHeader from '@/components/PageHeader.vue'
 import ChartCard from '@/components/ChartCard.vue'
 import { renewals } from '@/mock/data'
+import echarts from '@/utils/echarts'
 import {
   Refresh, Document, BellFilled, Bell, Check,
-  CircleCheckFilled, Warning, Close, Clock
+  CircleCheckFilled, Warning, Close, Clock, MagicStick,
+  DataAnalysis, Right
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRenewalStore } from '@/stores/renewal'
@@ -279,6 +281,234 @@ const stationNotifications = computed(() =>
 const allNotifications = computed(() => store.notifications)
 
 /* ---------- 生成报告 ---------- */
+/* ---------- KPI 增强 ---------- */
+const kpiStats = computed(() => {
+  const decisions = renewals.map(r => ({ r, d: store.getDecision(r.stationId) }))
+  const handled = decisions.filter(x => x.d.status !== 'pending')
+  const repricedUp = handled.filter(x => x.d.rateAdjust > 0).length
+  const repricedDown = handled.filter(x => x.d.rateAdjust < 0).length
+  const declined = handled.filter(x => x.d.status === 'declined').length
+  const premiums = handled.map(x => x.d.premium || 0).filter(p => p > 0)
+  const avgPremium = premiums.length ? premiums.reduce((a, b) => a + b, 0) / premiums.length : 0
+  return {
+    repricedUp, repricedDown, declined,
+    avgPremium,
+    declineRate: handled.length ? (declined / handled.length * 100).toFixed(0) : '0'
+  }
+})
+
+/* ---------- 智能策略推荐 ---------- */
+const smartRecommendation = computed(() => {
+  const r = selected.value
+  const scoreDelta = r.currentScore - r.lastYearScore
+  const sev = yoy.value.alarms.delta
+  if (r.trend === '下降' && scoreDelta >= 2) {
+    return {
+      action: 'down', confidence: 92,
+      title: '强烈建议：下调 5% 续保',
+      reasons: [
+        `风险评分上升 +${scoreDelta} 分，运行质量改善`,
+        `年告警数 ${sev < 0 ? '下降' : '稳定'}（${yoy.value.alarms.cur} 起 vs 去年 ${yoy.value.alarms.last}）`,
+        `循环次数 ${r.cycleCount} 处于合理区间`
+      ],
+      level: 'success'
+    }
+  }
+  if (r.trend === '上升' || scoreDelta < -3) {
+    return {
+      action: 'up', confidence: 87,
+      title: '建议：上调 8% 续保',
+      reasons: [
+        `风险评分 ${scoreDelta > 0 ? '+' : ''}${scoreDelta} 分，需谨慎核保`,
+        `年告警数 ${sev > 0 ? '上升 +' + sev : '基本持平'}`,
+        '建议附加运维改造条款'
+      ],
+      level: 'warning'
+    }
+  }
+  return {
+    action: 'agree', confidence: 78,
+    title: '建议：维持费率续保',
+    reasons: [
+      `评分趋势稳定（${scoreDelta >= 0 ? '+' : ''}${scoreDelta}）`,
+      '告警与循环未见异常',
+      '保留原费率即可'
+    ],
+    level: 'info'
+  }
+})
+function applyRecommendation() {
+  const a = smartRecommendation.value.action
+  if (a === 'down') repriceRenew('down')
+  else if (a === 'up') repriceRenew('up')
+  else agreeRenew()
+}
+
+/* ---------- 历史决策时间线（模拟 + 当前决策合并） ---------- */
+function hashSeed2(s) {
+  let h = 5381
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h) + s.charCodeAt(i)
+  return h >>> 0
+}
+const historyTimeline = computed(() => {
+  const r = selected.value
+  const d = currentDecision.value
+  const out = []
+  if (d.status !== 'pending') {
+    out.push({
+      time: d.decidedAt, year: dayjs(d.decidedAt).format('YYYY'),
+      title: statusMeta(d.status).label,
+      detail: d.rate ? `费率 ${d.rate}% · 年保费 ${fmtMoney(d.premium || 0)}` : (d.note || '—'),
+      by: d.by, level: d.status
+    })
+  }
+  // mock 过去 3 年决策（基于 stationId 哈希稳定）
+  const seed = hashSeed2(r.stationId)
+  const rng = mulberry32(seed)
+  const baseRate = 0.95
+  for (let yr = 1; yr <= 3; yr++) {
+    const year = dayjs().subtract(yr, 'year').year()
+    const date = dayjs().subtract(yr, 'year').format(`YYYY-MM-${10 + Math.floor(rng() * 18)} ${10 + Math.floor(rng() * 6)}:00:00`)
+    const adj = rng() < 0.3 ? (rng() < 0.5 ? -5 : 8) : 0
+    const rate = +(baseRate * (1 + adj / 100)).toFixed(3)
+    const premium = Math.round(3000 * 10000 * rate / 100 * 1.1)
+    out.push({
+      time: date, year: String(year),
+      title: adj === 0 ? '续保 · 维持费率' : adj > 0 ? '续保 · 上调费率' : '续保 · 下调费率',
+      detail: `费率 ${rate}% · 年保费 ${fmtMoney(premium)}`,
+      by: ['客户经理李', '续保员张', '风控员王'][Math.floor(rng() * 3)],
+      level: 'policied'
+    })
+  }
+  return out
+})
+
+/* ---------- 批量操作 ---------- */
+const batchSelected = ref([])
+function toggleBatchAll(checked) {
+  batchSelected.value = checked
+    ? renewals.filter(r => store.getDecision(r.stationId).status === 'pending').map(r => r.stationId)
+    : []
+}
+const allPendingSelected = computed(() => {
+  const pending = renewals.filter(r => store.getDecision(r.stationId).status === 'pending')
+  return pending.length > 0 && pending.every(r => batchSelected.value.includes(r.stationId))
+})
+async function batchAct(action) {
+  if (batchSelected.value.length === 0) {
+    ElMessage.warning('请先勾选要批量处理的站点')
+    return
+  }
+  const labels = { agree: '维持费率续保', up: '上调 8% 续保', down: '下调 5% 续保', defer: '暂缓' }
+  try {
+    await ElMessageBox.confirm(
+      `将对 ${batchSelected.value.length} 个站点执行「${labels[action]}」`,
+      '批量续保操作',
+      { type: action === 'up' ? 'warning' : 'success', confirmButtonText: '确认' }
+    )
+  } catch { return }
+  let n = 0
+  batchSelected.value.forEach(sid => {
+    const r = renewals.find(x => x.stationId === sid); if (!r) return
+    const baseRate = r.trend === '下降' ? 0.85 : r.trend === '上升' ? 1.10 : 0.95
+    if (action === 'defer') {
+      store.setDecision(sid, { status: 'deferred', decidedAt: dayjs().format('YYYY-MM-DD HH:mm:ss'), by: '批量操作' })
+    } else {
+      const adj = action === 'up' ? 8 : action === 'down' ? -5 : 0
+      const rate = +(baseRate * (1 + adj / 100)).toFixed(3)
+      const diff = Math.max(0, 90 - r.currentScore)
+      const prem = Math.round(3000 * 10000 * (rate / 100) * (1 + diff * 0.02) * 0.99)
+      store.setDecision(sid, {
+        status: adj === 0 ? 'agreed' : 'repriced',
+        decidedAt: dayjs().format('YYYY-MM-DD HH:mm:ss'),
+        rateAdjust: adj, rate, coverage: 3000, deductible: 5, premium: prem, by: '批量操作'
+      })
+    }
+    n++
+  })
+  batchSelected.value = []
+  ElMessage.success(`已批量${labels[action]} ${n} 个站点`)
+}
+
+/* ---------- 续保对比 dialog ---------- */
+const compareDialog = ref(false)
+const compareIds = ref([])
+const compareChartEl = ref(null)
+let compareChart = null
+function openCompare() {
+  if (compareIds.value.length < 2) compareIds.value = renewals.slice(0, 2).map(r => r.stationId)
+  compareDialog.value = true
+  // 等 dom 渲染后初始化
+  setTimeout(() => {
+    if (compareChartEl.value) {
+      compareChart?.dispose()
+      compareChart = echarts.init(compareChartEl.value)
+      renderCompareChart()
+    }
+  }, 300)
+}
+function renderCompareChart() {
+  if (!compareChart) return
+  const sel = compareIds.value.map(id => renewals.find(r => r.stationId === id)).filter(Boolean)
+  const indicators = [
+    { name: '风险评分', max: 100 },
+    { name: '上年评分', max: 100 },
+    { name: '运行小时×10', max: 1000 },
+    { name: '循环次数', max: 500 }
+  ]
+  compareChart.setOption({
+    tooltip: {},
+    radar: {
+      indicator: indicators, radius: 110,
+      splitArea: { areaStyle: { color: ['#f8fafc', '#fff'] } },
+      splitLine: { lineStyle: { color: '#e7eaf3' } },
+      axisName: { color: '#1a1f36', fontSize: 12 }
+    },
+    legend: { top: 0, textStyle: { fontSize: 12 } },
+    series: [{
+      type: 'radar',
+      data: sel.map((s, i) => ({
+        name: s.stationName,
+        value: [s.currentScore, s.lastYearScore, s.runHours / 10, s.cycleCount],
+        lineStyle: { color: i === 0 ? '#015eea' : '#ef4444', width: 2 },
+        areaStyle: { color: i === 0 ? 'rgba(1,94,234,0.18)' : 'rgba(239,68,68,0.18)' },
+        itemStyle: { color: i === 0 ? '#015eea' : '#ef4444' }
+      }))
+    }]
+  })
+}
+watch(compareIds, () => { if (compareDialog.value) renderCompareChart() }, { deep: true })
+
+/* ---------- 全量续保汇总 CSV ---------- */
+function exportAllSummary() {
+  const header = ['stationId', 'stationName', 'policy', 'expireDate', 'daysToExpire', 'lastYearScore', 'currentScore', 'trend', 'runHours', 'cycleCount', 'status', 'rate', 'premium', 'decidedAt', 'by']
+  const csv = [header.join(',')]
+  renewals.forEach(r => {
+    const d = store.getDecision(r.stationId)
+    const row = {
+      stationId: r.stationId, stationName: r.stationName, policy: r.policy,
+      expireDate: r.expireDate, daysToExpire: r.daysToExpire,
+      lastYearScore: r.lastYearScore, currentScore: r.currentScore, trend: r.trend,
+      runHours: r.runHours, cycleCount: r.cycleCount,
+      status: statusMeta(d.status).label,
+      rate: d.rate ? d.rate + '%' : '',
+      premium: d.premium || '',
+      decidedAt: d.decidedAt || '',
+      by: d.by || ''
+    }
+    csv.push(header.map(f => {
+      const v = row[f]; const s = v == null ? '' : String(v).replace(/"/g, '""')
+      return /[,"\n]/.test(s) ? `"${s}"` : s
+    }).join(','))
+  })
+  const blob = new Blob(['﻿' + csv.join('\n')], { type: 'text/csv;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url; a.download = `续保汇总-${dayjs().format('YYYY-MM-DD')}.csv`; a.click()
+  URL.revokeObjectURL(url)
+  ElMessage.success(`已导出 ${renewals.length} 条续保汇总数据`)
+}
+
 function generateReport() {
   const r = selected.value
   const d = currentDecision.value
@@ -322,6 +552,8 @@ function generateReport() {
       desc="年度数据自动分析 · 风险趋势研判 · 自动续保策略 · 报告一键生成"
     >
       <template #actions>
+        <el-button :icon="DataAnalysis" @click="openCompare">站点对比</el-button>
+        <el-button :icon="Document" @click="exportAllSummary">导出全量汇总</el-button>
         <el-button :icon="Bell" @click="historyDialog = true">
           推送历史<span v-if="allNotifications.length" class="badge">{{ allNotifications.length }}</span>
         </el-button>
@@ -344,14 +576,41 @@ function generateReport() {
         <div class="kp-sub">待处理 {{ renewals.filter(r => store.getDecision(r.stationId).status === 'pending').length }} 单</div>
       </div>
       <div class="kp-card">
-        <div class="kp-l">建议提价</div>
-        <div class="kp-v" style="color:#f59e0b">{{ renewals.filter(r => r.trend === '上升').length }} <span>单</span></div>
-        <div class="kp-sub">风险趋势上升</div>
+        <div class="kp-l">提价 / 降价 / 驳回</div>
+        <div class="kp-v">
+          <span style="color:#f59e0b">{{ kpiStats.repricedUp }}</span>
+          <span style="color:#8a93a8;margin:0 4px;font-size:18px">/</span>
+          <span style="color:#22d3a0">{{ kpiStats.repricedDown }}</span>
+          <span style="color:#8a93a8;margin:0 4px;font-size:18px">/</span>
+          <span style="color:#ef4444">{{ kpiStats.declined }}</span>
+        </div>
+        <div class="kp-sub">驳回率 {{ kpiStats.declineRate }}%</div>
+      </div>
+      <div class="kp-card">
+        <div class="kp-l">平均年保费</div>
+        <div class="kp-v" style="color:#015eea">{{ kpiStats.avgPremium > 0 ? fmtMoney(kpiStats.avgPremium) : '—' }}</div>
+        <div class="kp-sub">已通过单均值</div>
       </div>
       <div class="kp-card">
         <div class="kp-l">续保收入预估</div>
         <div class="kp-v" style="color:#015eea">{{ fmtMoney(estimatedIncome) }}</div>
         <div class="kp-sub">已通过续保汇总</div>
+      </div>
+    </div>
+
+    <!-- 批量操作工具条 -->
+    <div class="batch-bar" v-if="renewals.filter(r => store.getDecision(r.stationId).status === 'pending').length">
+      <el-checkbox
+        :model-value="allPendingSelected"
+        :indeterminate="batchSelected.length > 0 && !allPendingSelected"
+        @change="toggleBatchAll"
+      >全选待处理 ({{ renewals.filter(r => store.getDecision(r.stationId).status === 'pending').length }})</el-checkbox>
+      <span class="batch-info">已选 <b>{{ batchSelected.length }}</b> 个</span>
+      <div class="batch-actions">
+        <el-button size="small" type="success" :icon="Check" :disabled="!batchSelected.length" @click="batchAct('agree')">批量同意</el-button>
+        <el-button size="small" type="primary" plain :disabled="!batchSelected.length" @click="batchAct('down')">批量下调 5%</el-button>
+        <el-button size="small" type="warning" plain :disabled="!batchSelected.length" @click="batchAct('up')">批量上调 8%</el-button>
+        <el-button size="small" :icon="Clock" :disabled="!batchSelected.length" @click="batchAct('defer')">批量暂缓</el-button>
       </div>
     </div>
 
@@ -365,6 +624,13 @@ function generateReport() {
           :class="{ active: selected.stationId === r.stationId }"
           @click="pickStation(r)"
         >
+          <el-checkbox
+            v-if="store.getDecision(r.stationId).status === 'pending'"
+            class="li-check"
+            :model-value="batchSelected.includes(r.stationId)"
+            @click.stop
+            @change="(v) => v ? batchSelected.push(r.stationId) : batchSelected = batchSelected.filter(x => x !== r.stationId)"
+          />
           <div class="li-row">
             <span class="li-name">{{ r.stationName }}</span>
             <span class="li-status" :style="{ background: statusMeta(store.getDecision(r.stationId).status).color }">
@@ -446,6 +712,26 @@ function generateReport() {
           </el-alert>
         </div>
 
+        <!-- 智能策略推荐 -->
+        <div class="recommend card" :class="smartRecommendation.level"
+          v-if="currentDecision.status === 'pending'">
+          <div class="rec-head">
+            <div class="rec-l">
+              <el-icon class="rec-icon"><MagicStick /></el-icon>
+              <div>
+                <div class="rec-title">{{ smartRecommendation.title }}</div>
+                <div class="rec-sub">AI 智能推荐 · 置信度 {{ smartRecommendation.confidence }}%</div>
+              </div>
+            </div>
+            <el-button type="primary" :icon="Check" @click="applyRecommendation">采纳推荐</el-button>
+          </div>
+          <div class="rec-reasons">
+            <div class="rec-reason" v-for="(r, i) in smartRecommendation.reasons" :key="i">
+              <el-icon><Right /></el-icon>{{ r }}
+            </div>
+          </div>
+        </div>
+
         <div class="dual">
           <ChartCard title="12 个月风险评分趋势" desc="对比承保初/中/末期" :option="trendOption" height="300px" />
           <ChartCard title="告警等级热力分布" desc="月份 × 告警等级 / 颜色深浅 = 数量" :option="alarmHeatOption" height="300px" />
@@ -484,6 +770,25 @@ function generateReport() {
               <div class="cs-l">预估续保年保费</div>
               <div class="cs-v big">¥ {{ fmtMoney(premium) }}</div>
               <div class="cs-tip">= {{ calc.coverage }}万 × {{ calc.baseRate }}% × (1 + {{ (riskPremium * 100).toFixed(0) }}%) × (1 - 免赔调整)</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 历史决策时间线 -->
+        <div class="hist-card card">
+          <div class="st-head">
+            <div class="st-title">历史续保决策</div>
+            <el-tag size="small" effect="plain">{{ historyTimeline.length }} 条记录</el-tag>
+          </div>
+          <div class="ht-line">
+            <div class="ht-item" v-for="(h, i) in historyTimeline" :key="i" :class="h.level">
+              <div class="ht-year">{{ h.year }}</div>
+              <div class="ht-dot" />
+              <div class="ht-body">
+                <div class="ht-title">{{ h.title }}</div>
+                <div class="ht-detail">{{ h.detail }}</div>
+                <div class="ht-by">{{ h.time?.slice(5, 16) }} · {{ h.by }}</div>
+              </div>
             </div>
           </div>
         </div>
@@ -577,6 +882,39 @@ function generateReport() {
         暂无推送记录
       </div>
     </el-dialog>
+
+    <!-- 站点对比 dialog -->
+    <el-dialog v-model="compareDialog" title="续保站点对比" width="780">
+      <div class="cmp-pick">
+        <el-select v-model="compareIds" multiple :multiple-limit="3" placeholder="选择 2-3 个站点" style="width:100%">
+          <el-option v-for="r in renewals" :key="r.stationId" :label="r.stationName" :value="r.stationId" />
+        </el-select>
+      </div>
+      <div class="cmp-chart" ref="compareChartEl" />
+      <div class="cmp-table" v-if="compareIds.length >= 2">
+        <div class="ct-head">
+          <div>站点</div><div>趋势</div><div>评分</div><div>年告警</div><div>循环</div><div>状态</div>
+        </div>
+        <div class="ct-row" v-for="id in compareIds" :key="id">
+          <template v-if="renewals.find(x => x.stationId === id)">
+            <div class="ct-name">{{ renewals.find(x => x.stationId === id).stationName }}</div>
+            <div>
+              <el-tag :color="trendColor(renewals.find(x => x.stationId === id).trend)" effect="dark" size="small" style="border:none;color:#fff">
+                {{ renewals.find(x => x.stationId === id).trend }}
+              </el-tag>
+            </div>
+            <div>{{ renewals.find(x => x.stationId === id).currentScore }}</div>
+            <div>{{ renewals.find(x => x.stationId === id).runHours }} h</div>
+            <div>{{ renewals.find(x => x.stationId === id).cycleCount }} 次</div>
+            <div>
+              <el-tag :type="statusMeta(store.getDecision(id).status).tag" size="small">
+                {{ statusMeta(store.getDecision(id).status).label }}
+              </el-tag>
+            </div>
+          </template>
+        </div>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
@@ -609,10 +947,12 @@ function generateReport() {
   padding: 14px; border-radius: 8px; cursor: pointer; margin-bottom: 8px;
   transition: background 0.15s;
   border: 1px solid transparent;
+  position: relative;
   &:hover { background: $bg-soft; }
   &.active { background: rgba(1, 94, 234, 0.05); border-color: rgba(1, 94, 234, 0.18); }
 }
-.li-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.li-check { position: absolute; top: 10px; right: 8px; z-index: 2; }
+.li-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding-right: 22px; }
 .li-name { font-size: 13px; font-weight: 500; flex: 1; min-width: 0; }
 .li-status {
   font-size: 10px; padding: 2px 7px; border-radius: 9px; color: #fff; font-weight: 500;
@@ -704,6 +1044,81 @@ function generateReport() {
 .hi-empty { padding: 40px; text-align: center; color: $text-muted;
   .el-icon { font-size: 28px; margin-bottom: 8px; }
 }
+
+/* === 批量操作工具条 === */
+.batch-bar {
+  background: $bg-card; border: 1px solid $border-soft;
+  border-radius: $radius; padding: 10px 16px; margin-bottom: 16px;
+  display: flex; align-items: center; gap: 16px; box-shadow: $shadow-card;
+  flex-wrap: wrap;
+}
+.batch-info { font-size: 13px; color: $text-secondary; b { color: $brand-blue; font-family: $font-num; } }
+.batch-actions { display: flex; gap: 8px; margin-left: auto; }
+
+/* === 智能推荐卡 === */
+.recommend {
+  border-left: 4px solid #06b6d4;
+  background: linear-gradient(135deg, #f0fafe 0%, #fff 70%);
+  &.warning { border-left-color: #f59e0b; background: linear-gradient(135deg, #fff8eb 0%, #fff 70%); }
+  &.info    { border-left-color: #06b6d4; background: linear-gradient(135deg, #f0fafe 0%, #fff 70%); }
+  &.success { border-left-color: #22d3a0; background: linear-gradient(135deg, #f0fdf6 0%, #fff 70%); }
+}
+.rec-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.rec-l { display: flex; align-items: center; gap: 12px; }
+.rec-icon {
+  width: 38px; height: 38px; border-radius: 10px;
+  background: $grad-cyan; color: #fff;
+  display: flex; align-items: center; justify-content: center; font-size: 20px;
+  .recommend.warning & { background: linear-gradient(135deg, #f59e0b, #ef4444); }
+  .recommend.success & { background: linear-gradient(135deg, #22d3a0, #06b6d4); }
+}
+.rec-title { font-size: 15px; font-weight: 600; }
+.rec-sub { font-size: 11px; color: $text-muted; margin-top: 2px; }
+.rec-reasons { display: flex; flex-direction: column; gap: 6px; padding-top: 10px; border-top: 1px solid $border-soft; }
+.rec-reason {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: $text-secondary;
+  .el-icon { color: $brand-blue; font-size: 12px; }
+}
+
+/* === 历史决策时间线 === */
+.hist-card { padding-bottom: 8px; }
+.ht-line { position: relative; padding-left: 18px; }
+.ht-line::before {
+  content: ''; position: absolute; left: 5px; top: 6px; bottom: 18px;
+  width: 2px; background: $border-soft;
+}
+.ht-item {
+  position: relative; padding: 8px 0 12px;
+  display: grid; grid-template-columns: 56px 1fr; gap: 12px; align-items: flex-start;
+}
+.ht-dot {
+  position: absolute; left: -16px; top: 14px;
+  width: 10px; height: 10px; border-radius: 50%;
+  background: #06b6d4; box-shadow: 0 0 0 3px #fff;
+  .ht-item.agreed &   { background: #22d3a0; }
+  .ht-item.repriced & { background: #06b6d4; }
+  .ht-item.declined & { background: #ef4444; }
+  .ht-item.deferred & { background: #f59e0b; }
+  .ht-item.policied & { background: #015eea; }
+}
+.ht-year { font-family: $font-num; font-size: 14px; color: $text-muted; font-weight: 600; }
+.ht-title { font-size: 13px; font-weight: 600; }
+.ht-detail { font-size: 12px; color: $text-secondary; margin-top: 3px; font-family: $font-num; }
+.ht-by { font-size: 11px; color: $text-muted; margin-top: 3px; }
+
+/* === 对比 dialog === */
+.cmp-pick { margin-bottom: 14px; }
+.cmp-chart { width: 100%; height: 320px; }
+.cmp-table { margin-top: 16px; border-top: 1px solid $border-soft; padding-top: 12px; }
+.ct-head, .cmp-table .ct-row {
+  display: grid; grid-template-columns: 2fr 1fr 1fr 1fr 1fr 1fr;
+  gap: 10px; align-items: center;
+  padding: 8px 12px; font-size: 12px;
+}
+.ct-head { background: $bg-soft; border-radius: 6px; color: $text-muted; font-weight: 600; }
+.cmp-table .ct-row { border-bottom: 1px dashed $border-soft; }
+.ct-name { font-weight: 500; }
 
 @media (max-width: 1100px) {
   .layout { grid-template-columns: 1fr; }
