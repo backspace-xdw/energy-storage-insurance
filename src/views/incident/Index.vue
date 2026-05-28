@@ -793,7 +793,18 @@ function fakeData(inc, dimension) {
 
 .layout { display: grid; grid-template-columns: 280px 1fr; gap: 16px; align-items: flex-start; }
 
-.case { max-height: calc(100vh - 220px); overflow: auto; }
+/* 左侧事故列表 sticky 跟随视口；可滚动且滚动条更显眼 */
+.case {
+  position: sticky;
+  top: 16px;
+  max-height: calc(100vh - 100px);
+  overflow-y: auto;
+  scrollbar-color: #c4cad8 transparent;
+  scrollbar-width: thin;
+  &::-webkit-scrollbar { width: 8px; }
+  &::-webkit-scrollbar-thumb { background: #c4cad8; border-radius: 4px; }
+  &::-webkit-scrollbar-thumb:hover { background: #8a93a8; }
+}
 .case-item {
   padding: 12px 14px; border-radius: 8px; cursor: pointer; margin-bottom: 8px;
   border-left: 3px solid transparent;
