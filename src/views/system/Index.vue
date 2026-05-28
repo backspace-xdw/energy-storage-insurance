@@ -1,10 +1,12 @@
 <script setup>
-import { ref, computed, reactive } from 'vue'
+import { ref, computed, reactive, onMounted, onBeforeUnmount, nextTick, watch } from 'vue'
 import dayjs from 'dayjs'
+import echarts from '@/utils/echarts'
 import PageHeader from '@/components/PageHeader.vue'
+import ChartCard from '@/components/ChartCard.vue'
 import {
   Plus, Edit, Delete, Setting, User, Lock, Link, Document,
-  Search, Check, Connection
+  Search, Check, Connection, Monitor, RefreshLeft, DataAnalysis, Clock
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useSystemStore } from '@/stores/system'
@@ -213,14 +215,256 @@ const SETTING_DEFAULTS = {
 }
 const settingDraft = reactive({ ...SETTING_DEFAULTS, ...store.settings })
 function saveSettings() {
+  // 写历史快照（保存前的当前值）
+  store.snapshotSettings({ ...store.settings })
   Object.keys(settingDraft).forEach(k => store.setSetting(k, settingDraft[k]))
-  ElMessage.success('平台设置已保存')
+  ElMessage.success('平台设置已保存（历史快照已保留）')
 }
 function resetSettings() {
+  store.snapshotSettings({ ...store.settings })
   Object.assign(settingDraft, SETTING_DEFAULTS)
   Object.keys(SETTING_DEFAULTS).forEach(k => store.setSetting(k, SETTING_DEFAULTS[k]))
-  ElMessage.info('已恢复默认设置')
+  ElMessage.info('已恢复默认设置（已自动保留快照）')
 }
+
+/* ---------- 用户批量操作 ---------- */
+const userBatchSel = ref([])
+const allUsersSelected = computed(() => {
+  return filteredUsers.value.length > 0 && filteredUsers.value.every(u => userBatchSel.value.includes(u.id))
+})
+function toggleUserBatchAll(checked) {
+  userBatchSel.value = checked ? filteredUsers.value.map(u => u.id) : []
+}
+async function batchUserStatus(targetStatus) {
+  if (!userBatchSel.value.length) { ElMessage.warning('请勾选用户'); return }
+  try {
+    await ElMessageBox.confirm(
+      `将对 ${userBatchSel.value.length} 个用户执行「${targetStatus === 'active' ? '启用' : '禁用'}」`,
+      '批量状态调整',
+      { type: 'warning' }
+    )
+  } catch { return }
+  userBatchSel.value.forEach(id => {
+    const isAdded = store.addedUsers.find(u => u.id === id)
+    if (isAdded) {
+      const arr = store.addedUsers.map(u => u.id === id ? { ...u, status: targetStatus } : u)
+      store.addedUsers.splice(0, store.addedUsers.length, ...arr)
+    } else {
+      store.setUser(id, { status: targetStatus })
+    }
+  })
+  const n = userBatchSel.value.length
+  userBatchSel.value = []
+  ElMessage.success(`已批量${targetStatus === 'active' ? '启用' : '禁用'} ${n} 个用户`)
+}
+const assignRoleDialog = ref(false)
+const assignRole = ref('核保员')
+function openAssignRole() {
+  if (!userBatchSel.value.length) { ElMessage.warning('请勾选用户'); return }
+  assignRoleDialog.value = true
+}
+function submitAssignRole() {
+  userBatchSel.value.forEach(id => {
+    const isAdded = store.addedUsers.find(u => u.id === id)
+    if (isAdded) {
+      const arr = store.addedUsers.map(u => u.id === id ? { ...u, role: assignRole.value } : u)
+      store.addedUsers.splice(0, store.addedUsers.length, ...arr)
+    } else {
+      store.setUser(id, { role: assignRole.value })
+    }
+  })
+  const n = userBatchSel.value.length
+  userBatchSel.value = []
+  assignRoleDialog.value = false
+  ElMessage.success(`已批量分配角色「${assignRole.value}」给 ${n} 个用户`)
+}
+
+/* ---------- 接口批量测试 ---------- */
+const batchTesting = ref(false)
+async function batchTestAll() {
+  batchTesting.value = true
+  for (const iface of interfaces.value) {
+    await testInterface(iface)
+  }
+  batchTesting.value = false
+  ElMessage.success(`已完成 ${interfaces.value.length} 个接口的批量测试`)
+}
+
+/* ---------- 接口监控历史 dialog ---------- */
+const ifaceHistoryDialog = ref(false)
+const ifaceHistoryName = ref('')
+const ifaceHistoryEl = ref(null)
+let ifaceHistoryChart = null
+function openInterfaceHistory(iface) {
+  ifaceHistoryName.value = iface.name
+  ifaceHistoryDialog.value = true
+  nextTick(() => {
+    if (ifaceHistoryEl.value) {
+      ifaceHistoryChart?.dispose()
+      ifaceHistoryChart = echarts.init(ifaceHistoryEl.value)
+      renderHistoryChart()
+    }
+  })
+}
+function renderHistoryChart() {
+  if (!ifaceHistoryChart) return
+  const list = (store.interfaceHistory[ifaceHistoryName.value] || []).slice().reverse()
+  if (!list.length) {
+    ifaceHistoryChart.setOption({
+      title: { text: '尚无测试历史', left: 'center', top: 'center', textStyle: { color: '#8a93a8', fontSize: 13, fontWeight: 'normal' } }
+    })
+    return
+  }
+  ifaceHistoryChart.setOption({
+    tooltip: { trigger: 'axis' },
+    grid: { left: 50, right: 16, top: 28, bottom: 30 },
+    xAxis: {
+      type: 'category', data: list.map(p => dayjs(p.time).format('HH:mm:ss')),
+      axisLabel: { color: '#525c75', fontSize: 11 }
+    },
+    yAxis: { type: 'value', name: '延迟 (ms)', splitLine: { lineStyle: { color: '#eef0f7' } } },
+    series: [{
+      type: 'line', smooth: true, showSymbol: true, symbolSize: 8,
+      data: list.map(p => parseInt(p.latency) || 0),
+      lineStyle: { color: '#015eea', width: 2.5 },
+      itemStyle: { color: (p) => p.value > 200 ? '#f59e0b' : '#22d3a0' },
+      areaStyle: { color: 'rgba(1,94,234,0.08)' },
+      markLine: { symbol: 'none', data: [
+        { yAxis: 200, label: { formatter: '阈值 200ms', color: '#ef4444' }, lineStyle: { color: '#ef4444', type: 'dashed' } }
+      ]}
+    }]
+  })
+}
+watch(ifaceHistoryDialog, (v) => {
+  if (!v) { ifaceHistoryChart?.dispose(); ifaceHistoryChart = null }
+})
+
+/* ---------- 日志详情抽屉 + 操作类型分布 ---------- */
+const logDetailDrawer = ref(false)
+const logDetail = ref(null)
+function openLogDetail(log) { logDetail.value = log; logDetailDrawer.value = true }
+
+const logActionStats = computed(() => {
+  const stats = {}
+  filteredLogs.value.forEach(l => { stats[l.action] = (stats[l.action] || 0) + 1 })
+  return stats
+})
+const logActionColors = {
+  '查询': '#06b6d4', '查看': '#015eea', '导出': '#f59e0b',
+  '存证': '#22d3a0', '处置': '#6366f1', '通过核保': '#22d3a0', '续保提醒': '#06b6d4'
+}
+const logPieOption = computed(() => ({
+  tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
+  legend: { bottom: 0, icon: 'circle', textStyle: { fontSize: 11 } },
+  series: [{
+    type: 'pie', radius: ['52%', '76%'],
+    avoidLabelOverlap: false, label: { show: false }, labelLine: { show: false },
+    data: Object.entries(logActionStats.value).map(([k, v]) => ({
+      name: k, value: v, itemStyle: { color: logActionColors[k] || '#8a93a8' }
+    }))
+  }]
+}))
+
+/* ---------- 系统健康监控 ---------- */
+const healthMetrics = reactive({
+  cpu: 38, memory: 62, disk: 47,
+  diskTotal: 2048, diskUsed: 968,
+  uptime: 38, // days
+  network: { in: 12.4, out: 8.1 }  // MB/s
+})
+const healthSeries = reactive({
+  cpu: Array.from({ length: 30 }, () => 30 + Math.random() * 20),
+  mem: Array.from({ length: 30 }, () => 55 + Math.random() * 15),
+  net: Array.from({ length: 30 }, () => 8 + Math.random() * 8)
+})
+const healthChartEl = ref(null)
+let healthChart = null
+function renderHealthChart() {
+  if (!healthChart) return
+  const labels = Array.from({ length: 30 }, (_, i) => `-${(30-i)*2}s`)
+  healthChart.setOption({
+    tooltip: { trigger: 'axis' },
+    legend: { top: 0, right: 0, textStyle: { fontSize: 11 } },
+    grid: { left: 40, right: 16, top: 30, bottom: 24 },
+    xAxis: { type: 'category', data: labels, axisLabel: { color: '#525c75', fontSize: 10, interval: 4 } },
+    yAxis: { type: 'value', min: 0, max: 100, splitLine: { lineStyle: { color: '#eef0f7' } } },
+    series: [
+      { name: 'CPU %', type: 'line', smooth: true, showSymbol: false, data: [...healthSeries.cpu],
+        lineStyle: { color: '#015eea', width: 2 }, areaStyle: { color: 'rgba(1,94,234,0.1)' } },
+      { name: '内存 %', type: 'line', smooth: true, showSymbol: false, data: [...healthSeries.mem],
+        lineStyle: { color: '#22d3a0', width: 2 }, areaStyle: { color: 'rgba(34,211,160,0.1)' } },
+      { name: '网络 MB/s', type: 'line', smooth: true, showSymbol: false, data: [...healthSeries.net],
+        lineStyle: { color: '#f59e0b', width: 2 } }
+    ]
+  })
+}
+let healthTimer = null
+function startHealthMonitor() {
+  stopHealthMonitor()
+  healthTimer = setInterval(() => {
+    healthMetrics.cpu = +(30 + Math.random() * 25).toFixed(0)
+    healthMetrics.memory = +(55 + Math.random() * 18).toFixed(0)
+    healthMetrics.network.in = +(10 + Math.random() * 8).toFixed(1)
+    healthMetrics.network.out = +(5 + Math.random() * 7).toFixed(1)
+    healthSeries.cpu.push(healthMetrics.cpu); healthSeries.cpu.shift()
+    healthSeries.mem.push(healthMetrics.memory); healthSeries.mem.shift()
+    healthSeries.net.push(healthMetrics.network.in); healthSeries.net.shift()
+    if (activeTab.value === 'health') renderHealthChart()
+  }, 2000)
+}
+function stopHealthMonitor() { if (healthTimer) { clearInterval(healthTimer); healthTimer = null } }
+
+watch(activeTab, (v) => {
+  if (v === 'health') {
+    nextTick(() => {
+      if (healthChartEl.value) {
+        healthChart?.dispose()
+        healthChart = echarts.init(healthChartEl.value)
+        renderHealthChart()
+      }
+    })
+  }
+})
+
+onMounted(() => startHealthMonitor())
+onBeforeUnmount(() => {
+  stopHealthMonitor()
+  healthChart?.dispose()
+  ifaceHistoryChart?.dispose()
+})
+
+/* ---------- 设置回滚 dialog ---------- */
+const rollbackDialog = ref(false)
+async function doRollback(id) {
+  try {
+    await ElMessageBox.confirm('确认回滚到该版本？当前值将被覆盖', '回滚设置', { type: 'warning' })
+  } catch { return }
+  store.snapshotSettings({ ...store.settings })  // 先保存当前
+  const entry = store.rollbackSettings(id)
+  if (entry) {
+    Object.assign(settingDraft, SETTING_DEFAULTS, entry.snapshot)
+    ElMessage.success(`已回滚到 ${dayjs(entry.time).format('MM-DD HH:mm')}`)
+  }
+  rollbackDialog.value = false
+}
+
+/* ---------- 角色权限对比 dialog ---------- */
+const compareDialog = ref(false)
+const compareRoles = ref([])
+function openCompareRoles() {
+  if (compareRoles.value.length < 2) {
+    compareRoles.value = rolesWithPerms.value.slice(0, 2).map(r => r.name)
+  }
+  compareDialog.value = true
+}
+const comparedPermsTable = computed(() => {
+  const sel = compareRoles.value.map(name => rolesWithPerms.value.find(r => r.name === name)).filter(Boolean)
+  if (sel.length < 2) return []
+  return ALL_PERMS.map(p => ({
+    perm: p,
+    ...Object.fromEntries(sel.map(r => [r.name, r.permissions.includes(p)]))
+  }))
+})
 </script>
 
 <template>
@@ -277,7 +521,26 @@ function resetSettings() {
             </div>
             <el-button type="primary" :icon="Plus" @click="openAddUser">新增用户</el-button>
           </div>
-          <el-table :data="filteredUsers" stripe>
+          <!-- 批量工具条 -->
+          <div class="batch-bar" v-if="filteredUsers.length">
+            <el-checkbox
+              :model-value="allUsersSelected"
+              :indeterminate="userBatchSel.length > 0 && !allUsersSelected"
+              @change="toggleUserBatchAll"
+            >全选 ({{ filteredUsers.length }})</el-checkbox>
+            <span class="batch-info">已选 <b>{{ userBatchSel.length }}</b> 个</span>
+            <div class="batch-actions">
+              <el-button size="small" type="success" :disabled="!userBatchSel.length" @click="batchUserStatus('active')">批量启用</el-button>
+              <el-button size="small" type="warning" plain :disabled="!userBatchSel.length" @click="batchUserStatus('inactive')">批量禁用</el-button>
+              <el-button size="small" type="primary" plain :disabled="!userBatchSel.length" @click="openAssignRole">批量分配角色</el-button>
+            </div>
+          </div>
+          <el-table
+            :data="filteredUsers" stripe
+            row-key="id"
+            @selection-change="(rows) => userBatchSel = rows.map(r => r.id)"
+          >
+            <el-table-column type="selection" width="42" />
             <el-table-column prop="id" label="ID" width="70" />
             <el-table-column prop="name" label="姓名" width="120" />
             <el-table-column prop="role" label="角色" width="120">
@@ -312,6 +575,9 @@ function resetSettings() {
         <template #label>
           <span class="tab-l"><el-icon><Lock /></el-icon> 角色权限</span>
         </template>
+        <div class="role-toolbar">
+          <el-button :icon="DataAnalysis" @click="openCompareRoles">权限差异对比</el-button>
+        </div>
         <div class="role-grid">
           <div class="role-card" v-for="r in rolesWithPerms" :key="r.name">
             <div class="rc-head">
@@ -336,8 +602,11 @@ function resetSettings() {
         </template>
         <div class="card">
           <div class="tc-head">
-            <div class="title">接口对接状态</div>
-            <el-tag type="success">{{ interfaces.filter(i => i.status === 'online').length }} / {{ interfaces.length }} 在线</el-tag>
+            <div class="tc-left">
+              <div class="title">接口对接状态</div>
+              <el-tag type="success">{{ interfaces.filter(i => i.status === 'online').length }} / {{ interfaces.length }} 在线</el-tag>
+            </div>
+            <el-button type="primary" :icon="Connection" :loading="batchTesting" @click="batchTestAll">批量测试全部</el-button>
           </div>
           <el-table :data="interfaces" stripe>
             <el-table-column prop="name" label="接口名称" min-width="180" />
@@ -365,13 +634,16 @@ function resetSettings() {
                 </el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="160">
+            <el-table-column label="操作" width="200">
               <template #default="{ row }">
                 <el-button text type="primary"
                   :icon="Connection"
                   :loading="testingInterface === row.name"
                   @click="testInterface(row)"
-                >测试连接</el-button>
+                >测试</el-button>
+                <el-button text type="primary" :icon="DataAnalysis" @click="openInterfaceHistory(row)">
+                  历史 ({{ (store.interfaceHistory[row.name] || []).length }})
+                </el-button>
               </template>
             </el-table-column>
           </el-table>
@@ -388,6 +660,18 @@ function resetSettings() {
             <div class="title">操作审计日志 ({{ filteredLogs.length }})</div>
             <el-button size="default" :icon="Document" @click="exportLogs">导出 CSV</el-button>
           </div>
+          <div class="log-summary">
+            <div class="ls-chart">
+              <ChartCard title="操作类型分布" :option="logPieOption" height="180px" :key="filteredLogs.length" />
+            </div>
+            <div class="ls-stats">
+              <div class="lst-item" v-for="(c, k) in logActionStats" :key="k">
+                <span class="lst-dot" :style="{ background: logActionColors[k] || '#8a93a8' }" />
+                <span class="lst-label">{{ k }}</span>
+                <span class="lst-count">{{ c }}</span>
+              </div>
+            </div>
+          </div>
           <div class="log-filters">
             <el-input v-model="logSearch" placeholder="搜索 用户/对象内容" clearable :prefix-icon="Search" size="default" style="width:240px" />
             <el-select v-model="logAction" placeholder="操作类型" clearable size="default" style="width:130px">
@@ -401,7 +685,7 @@ function resetSettings() {
             </el-select>
             <el-date-picker v-model="logDateRange" type="daterange" size="default" range-separator="-" start-placeholder="开始" end-placeholder="结束" style="width:260px" />
           </div>
-          <el-table :data="filteredLogs" stripe>
+          <el-table :data="filteredLogs" stripe @row-click="openLogDetail">
             <el-table-column prop="time" label="时间" width="180" />
             <el-table-column prop="user" label="用户" width="110" />
             <el-table-column prop="action" label="操作类型" width="100">
@@ -498,9 +782,63 @@ function resetSettings() {
             </div>
           </div>
           <div class="set-actions">
+            <el-button :icon="Clock" @click="rollbackDialog = true" :disabled="!store.settingsHistory.length">
+              保存历史 ({{ store.settingsHistory.length }})
+            </el-button>
             <el-button @click="resetSettings">恢复默认</el-button>
             <el-button type="primary" :icon="Check" @click="saveSettings">保存设置</el-button>
           </div>
+        </div>
+      </el-tab-pane>
+
+      <!-- 系统健康监控 -->
+      <el-tab-pane name="health">
+        <template #label>
+          <span class="tab-l"><el-icon><Monitor /></el-icon> 系统健康</span>
+        </template>
+        <div class="health-grid">
+          <div class="hm-card">
+            <div class="hm-l">CPU 占用</div>
+            <div class="hm-v" :class="healthMetrics.cpu > 80 ? 'err' : healthMetrics.cpu > 60 ? 'warn' : ''">
+              {{ healthMetrics.cpu }}<small>%</small>
+            </div>
+            <el-progress :percentage="healthMetrics.cpu" :status="healthMetrics.cpu > 80 ? 'exception' : healthMetrics.cpu > 60 ? 'warning' : 'success'" :show-text="false" />
+          </div>
+          <div class="hm-card">
+            <div class="hm-l">内存占用</div>
+            <div class="hm-v" :class="healthMetrics.memory > 85 ? 'err' : healthMetrics.memory > 70 ? 'warn' : ''">
+              {{ healthMetrics.memory }}<small>%</small>
+            </div>
+            <el-progress :percentage="healthMetrics.memory" :status="healthMetrics.memory > 85 ? 'exception' : healthMetrics.memory > 70 ? 'warning' : 'success'" :show-text="false" />
+          </div>
+          <div class="hm-card">
+            <div class="hm-l">磁盘使用</div>
+            <div class="hm-v">{{ healthMetrics.disk }}<small>%</small></div>
+            <div class="hm-sub">{{ healthMetrics.diskUsed }} / {{ healthMetrics.diskTotal }} GB</div>
+            <el-progress :percentage="healthMetrics.disk" status="success" :show-text="false" />
+          </div>
+          <div class="hm-card">
+            <div class="hm-l">网络吞吐</div>
+            <div class="hm-v">{{ healthMetrics.network.in }}<small>MB/s ↓</small></div>
+            <div class="hm-sub">↑ {{ healthMetrics.network.out }} MB/s</div>
+          </div>
+          <div class="hm-card">
+            <div class="hm-l">运行时长</div>
+            <div class="hm-v">{{ healthMetrics.uptime }}<small>天</small></div>
+            <div class="hm-sub">无重启故障</div>
+          </div>
+          <div class="hm-card">
+            <div class="hm-l">接口平均延迟</div>
+            <div class="hm-v">
+              {{ Math.round(interfaces.reduce((s, i) => s + parseInt(i.latency), 0) / interfaces.length) }}<small>ms</small>
+            </div>
+            <div class="hm-sub">{{ interfaces.filter(i => i.status === 'online').length }} / {{ interfaces.length }} 接口在线</div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="title">实时性能监控 (60s)</div>
+          <div ref="healthChartEl" style="width:100%;height:300px;margin-top:12px" />
         </div>
       </el-tab-pane>
     </el-tabs>
@@ -530,6 +868,111 @@ function resetSettings() {
         <el-button @click="userDialog = false">取消</el-button>
         <el-button type="primary" @click="submitUser">{{ editingUser ? '保存' : '创建' }}</el-button>
       </template>
+    </el-dialog>
+
+    <!-- 批量分配角色 dialog -->
+    <el-dialog v-model="assignRoleDialog" title="批量分配角色" width="420">
+      <el-form label-width="80px">
+        <el-form-item label="目标用户">
+          <el-tag>{{ userBatchSel.length }} 个</el-tag>
+        </el-form-item>
+        <el-form-item label="分配角色">
+          <el-select v-model="assignRole" style="width:100%">
+            <el-option v-for="r in rolesWithPerms" :key="r.name" :label="r.name" :value="r.name" />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="assignRoleDialog = false">取消</el-button>
+        <el-button type="primary" @click="submitAssignRole">确认分配</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 接口监控历史 dialog -->
+    <el-dialog v-model="ifaceHistoryDialog" :title="`${ifaceHistoryName} - 监控历史`" width="640">
+      <div ref="ifaceHistoryEl" style="width:100%;height:300px" />
+      <div class="ih-list">
+        <div class="ih-row" v-for="(p, i) in (store.interfaceHistory[ifaceHistoryName] || [])" :key="i">
+          <span class="ih-time">{{ dayjs(p.time).format('MM-DD HH:mm:ss') }}</span>
+          <span class="ih-latency" :style="{ color: parseInt(p.latency) > 200 ? '#f59e0b' : '#22d3a0' }">{{ p.latency }}</span>
+          <el-tag size="small" :type="p.status === 'online' ? 'success' : 'warning'">{{ p.status === 'online' ? '在线' : '延迟高' }}</el-tag>
+        </div>
+        <div class="ih-empty" v-if="!(store.interfaceHistory[ifaceHistoryName] || []).length">
+          暂无测试历史，点击"测试连接"开始记录
+        </div>
+      </div>
+    </el-dialog>
+
+    <!-- 日志详情抽屉 -->
+    <el-drawer v-model="logDetailDrawer" title="审计日志详情" size="460" direction="rtl">
+      <template v-if="logDetail">
+        <div class="ld-section">
+          <div class="ld-l">操作时间</div>
+          <div class="ld-v mono">{{ logDetail.time }}</div>
+        </div>
+        <div class="ld-section">
+          <div class="ld-l">操作类型</div>
+          <el-tag :type="logDetail.action === '导出' ? 'warning' : logDetail.action === '存证' ? 'success' : logDetail.action === '处置' ? 'primary' : 'info'">
+            {{ logDetail.action }}
+          </el-tag>
+        </div>
+        <div class="ld-section">
+          <div class="ld-l">操作用户</div>
+          <div class="ld-v">{{ logDetail.user }}</div>
+        </div>
+        <div class="ld-section">
+          <div class="ld-l">对象 / 内容</div>
+          <div class="ld-v">{{ logDetail.target }}</div>
+        </div>
+        <div class="ld-section">
+          <div class="ld-l">IP 地址</div>
+          <div class="ld-v mono">{{ logDetail.ip }}</div>
+        </div>
+        <div class="ld-section">
+          <div class="ld-l">完整信息（JSON）</div>
+          <pre class="ld-payload">{{ JSON.stringify(logDetail, null, 2) }}</pre>
+        </div>
+      </template>
+    </el-drawer>
+
+    <!-- 设置回滚 dialog -->
+    <el-dialog v-model="rollbackDialog" title="平台设置 - 历史快照" width="560">
+      <div class="rb-empty" v-if="!store.settingsHistory.length">暂无历史快照</div>
+      <div class="rb-list" v-else>
+        <div class="rb-row" v-for="s in store.settingsHistory" :key="s.id">
+          <div class="rb-info">
+            <div class="rb-time">{{ dayjs(s.time).format('YYYY-MM-DD HH:mm:ss') }}</div>
+            <div class="rb-by">{{ s.by }}</div>
+            <div class="rb-keys">含 {{ Object.keys(s.snapshot).length }} 项设置</div>
+          </div>
+          <el-button size="small" type="primary" plain :icon="RefreshLeft" @click="doRollback(s.id)">回滚到此版本</el-button>
+        </div>
+      </div>
+    </el-dialog>
+
+    <!-- 角色对比 dialog -->
+    <el-dialog v-model="compareDialog" title="角色权限差异对比" width="720">
+      <div class="rc-pick">
+        <el-select v-model="compareRoles" multiple :multiple-limit="3" placeholder="选 2-3 个角色" style="width:100%">
+          <el-option v-for="r in rolesWithPerms" :key="r.name" :label="r.name" :value="r.name" />
+        </el-select>
+      </div>
+      <div class="rc-table" v-if="comparedPermsTable.length && compareRoles.length >= 2">
+        <div class="rt-head" :style="{ gridTemplateColumns: `2fr repeat(${compareRoles.length}, 1fr)` }">
+          <div>权限</div>
+          <div v-for="rn in compareRoles" :key="rn">{{ rn }}</div>
+        </div>
+        <div class="rt-row" v-for="p in comparedPermsTable" :key="p.perm"
+          :style="{ gridTemplateColumns: `2fr repeat(${compareRoles.length}, 1fr)` }"
+          :class="{ diff: compareRoles.some((r, i) => p[r] !== p[compareRoles[0]]) }"
+        >
+          <div class="rt-perm">{{ p.perm }}</div>
+          <div v-for="rn in compareRoles" :key="rn" class="rt-cell">
+            <el-icon v-if="p[rn]" style="color:#22d3a0;font-size:16px"><Check /></el-icon>
+            <span v-else style="color:#c4cad8">—</span>
+          </div>
+        </div>
+      </div>
     </el-dialog>
 
     <!-- 角色权限 dialog -->
@@ -610,6 +1053,100 @@ function resetSettings() {
 .rp-tip { font-size: 12px; color: $text-muted; margin-bottom: 12px; b { color: $brand-blue; font-family: $font-num; } }
 .rp-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
 
+/* === 批量工具条 === */
+.batch-bar {
+  background: $bg-soft; border-radius: 8px;
+  padding: 8px 14px; margin-bottom: 12px;
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+}
+.batch-info { font-size: 12px; color: $text-secondary; b { color: $brand-blue; font-family: $font-num; } }
+.batch-actions { display: flex; gap: 8px; margin-left: auto; }
+
+/* === 日志统计 === */
+.log-summary { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-bottom: 14px; }
+.ls-stats { display: flex; flex-direction: column; gap: 6px; padding: 12px 0; }
+.lst-item { display: flex; align-items: center; gap: 10px; padding: 8px 14px;
+  background: $bg-soft; border-radius: 6px; font-size: 13px;
+}
+.lst-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.lst-label { flex: 1; }
+.lst-count { font-family: $font-num; font-weight: 600; color: $brand-blue; }
+
+/* === 健康监控 === */
+.health-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; padding: 8px 0; }
+.hm-card {
+  background: $bg-card; border: 1px solid $border-soft;
+  border-radius: $radius; padding: 18px 20px; box-shadow: $shadow-card;
+}
+.hm-l { font-size: 12px; color: $text-muted; }
+.hm-v { font-size: 32px; font-weight: 600; font-family: $font-num;
+  margin: 6px 0 10px; color: $brand-blue;
+  small { font-size: 13px; color: $text-muted; font-weight: 400; margin-left: 4px; }
+  &.warn { color: #f59e0b; }
+  &.err  { color: #ef4444; }
+}
+.hm-sub { font-size: 11px; color: $text-muted; margin-bottom: 8px; font-family: $font-num; }
+
+/* === 角色对比 dialog === */
+.rc-pick { margin-bottom: 14px; }
+.rc-table { border: 1px solid $border-soft; border-radius: 6px; overflow: hidden; }
+.rt-head, .rt-row {
+  display: grid; gap: 8px; align-items: center;
+  padding: 8px 14px; font-size: 12px;
+}
+.rt-head { background: $bg-soft; color: $text-muted; font-weight: 600; }
+.rt-row {
+  border-bottom: 1px dashed $border-soft;
+  &.diff { background: rgba(245,158,11,0.04); }
+  &:last-child { border-bottom: 0; }
+}
+.rt-perm { font-weight: 500; }
+.rt-cell { text-align: center; }
+
+/* === 接口监控历史 === */
+.ih-list { margin-top: 12px; max-height: 200px; overflow-y: auto; padding: 4px 0;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.ih-row {
+  display: grid; grid-template-columns: 1fr 100px 70px; gap: 12px;
+  padding: 6px 12px; font-size: 12px;
+  background: $bg-soft; border-radius: 4px;
+  align-items: center;
+}
+.ih-time { font-family: $font-num; color: $text-secondary; }
+.ih-latency { font-family: $font-num; font-weight: 600; text-align: right; }
+.ih-empty { padding: 24px; text-align: center; color: $text-muted; font-size: 12px; }
+
+/* === 日志详情 drawer === */
+.ld-section { margin-bottom: 18px; }
+.ld-l { font-size: 11px; color: $text-muted; margin-bottom: 4px; }
+.ld-v { font-size: 14px; }
+.ld-payload {
+  background: #10152e; color: #b3c5ff;
+  padding: 12px 14px; border-radius: 6px;
+  font-family: 'JetBrains Mono', Menlo, monospace; font-size: 12px; line-height: 1.7;
+  margin: 6px 0 0; overflow-x: auto;
+}
+
+/* === 设置回滚 dialog === */
+.rb-list { display: flex; flex-direction: column; gap: 8px; max-height: 360px; overflow-y: auto; }
+.rb-row {
+  background: $bg-soft; border-radius: 8px; padding: 12px 14px;
+  display: flex; justify-content: space-between; align-items: center;
+}
+.rb-info { display: flex; flex-direction: column; gap: 2px; }
+.rb-time { font-size: 13px; font-weight: 500; font-family: $font-num; }
+.rb-by { font-size: 11px; color: $text-muted; }
+.rb-keys { font-size: 11px; color: $text-secondary; margin-top: 2px; }
+.rb-empty { padding: 32px; text-align: center; color: $text-muted; }
+
+/* === 角色对比工具栏 === */
+.role-toolbar { display: flex; justify-content: flex-end; margin-bottom: 12px; padding: 4px 0; }
+
+@media (max-width: 1300px) {
+  .health-grid { grid-template-columns: repeat(2, 1fr); }
+  .log-summary { grid-template-columns: 1fr; }
+}
 @media (max-width: 1100px) {
   .overview, .role-grid, .ss-grid, .rp-grid { grid-template-columns: 1fr 1fr; }
 }
